@@ -1,0 +1,113 @@
+# ClawBox 教育场景配置
+# 预置教育 Pipeline + 缓存优化
+
+# ========== 教育 Pipeline 继承自 proxyclaw ==========
+# 已有模板: config/initdata/pipeline-templates/24-education-scene.yaml
+# 通过 #edu 快捷码触发
+
+# ========== 教育场景快捷码 ==========
+EDUCATION_SCENES:
+  # 默认答疑
+  - code: "#edu"
+    name: 通用答疑
+    scene: qa
+  
+  # 解题辅导
+  - code: "#edu 解题"
+  - code: "#solving"
+    name: 解题辅导
+    scene: problem_solving
+  
+  # 概念讲解
+  - code: "#edu 讲解"
+  - code: "#explain"
+    name: 概念讲解
+    scene: explain
+  
+  # 知识点思考
+  - code: "#edu 知识点"
+  - code: "#think"
+    name: 知识点深度思考
+    scene: knowledge_thinking
+  
+  # 作文批改
+  - code: "#edu 作文"
+  - code: "#essay"
+    name: 作文批改
+    scene: essay_review
+  
+  # 口语练习
+  - code: "#edu 口语"
+  - code: "#speak"
+    name: 英语口语练习
+    scene: speaking
+
+# ========== 缓存策略 ==========
+# 教育场景开启语义缓存，降低 API 成本
+CACHE_CONFIG:
+  enabled: true
+  layers:
+    - name: "L1-精确缓存"
+      type: exact
+      ttl: 86400  # 24小时
+    - name: "L2-语义缓存"
+      type: semantic
+      threshold: 0.92
+      ttl: 604800  # 7天
+
+# ========== 学科配置 ==========
+SUBJECTS:
+  - id: math
+    name: 数学
+    icon: 📐
+  - id: chinese
+    name: 语文
+    icon: 📖
+  - id: english
+    name: 英语
+    icon: 🔤
+  - id: physics
+    name: 物理
+    icon: ⚡
+  - id: chemistry
+    name: 化学
+    icon: 🧪
+  - id: biology
+    name: 生物
+    icon: 🧬
+  - id: history
+    name: 历史
+    icon: 📜
+  - id: geography
+    name: 地理
+    icon: 🌍
+  - id: politics
+    name: 政治
+    icon: 📊
+
+# ========== 年级配置 ==========
+GRADES:
+  - id: grade1
+    name: 小学一年级
+  - id: grade2
+    name: 小学二年级
+  - id: grade3
+    name: 小学三年级
+  - id: grade4
+    name: 小学四年级
+  - id: grade5
+    name: 小学五年级
+  - id: grade6
+    name: 小学六年级
+  - id: grade7
+    name: 初中一年级
+  - id: grade8
+    name: 初中二年级
+  - id: grade9
+    name: 初中三年级
+  - id: grade10
+    name: 高中一年级
+  - id: grade11
+    name: 高中二年级
+  - id: grade12
+    name: 高中三年级

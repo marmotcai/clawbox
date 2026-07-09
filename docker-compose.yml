@@ -1,0 +1,118 @@
+# ClawBox — 教育 AI 服务器
+# docker-compose.yml — 核心服务编排
+
+version: '3.8'
+
+services:
+  # ========== proxyclaw 核心 ==========
+  proxyclaw:
+    image: ${PROXYCLAW_IMAGE:-proxyclaw/proxyclaw:latest}
+    container_name: clawbox-proxyclaw
+    restart: unless-stopped
+    ports:
+      - "${PROXYCLAW_PORT:-20060}:20060"
+    environment:
+      # 基础配置
+      - LLM_PROXY_EDITION=team
+      - LLM_PROXY_SERVER_PORT=20060
+      - LLM_PROXY_SERVER_HOST=0.0.0.0
+      # 数据库 (PostgreSQL + pgvector)
+      - LLM_PROXY_DB_DRIVER=postgresql
+      - PG_HOST=clawbox-postgresql
+      - PG_PORT=5432
+      - PG_USER=postgres
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_DATABASE=proxyclaw
+      - PG_SSL_MODE=disable
+      # 管理员
+      - LLM_PROXY_ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - LLM_PROXY_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      # Ollama (embedding)
+      - OLLAMA_ENABLED=true
+      - OLLAMA_HOST=http://clawbox-ollama:11434
+      - OLLAMA_BASE_URL=http://clawbox-ollama:11434
+      - EMBEDDING_BACKEND=ollama-local
+      - EMBEDDING_MODEL=bge-m3
+      # 日志
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LLM_PROXY_LOG_PATH=/app/logs
+      - LLM_PROXY_LOG_OUTPUT=both
+      - LLM_PROXY_LOG_FORMAT=console
+      # 时区
+      - TZ=Asia/Shanghai
+    volumes:
+      - proxyclaw_data:/app/storage
+      - proxyclaw_logs:/app/logs
+      - proxyclaw_config:/app/config
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - clawbox-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:20060/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ========== PostgreSQL + pgvector ==========
+  postgresql:
+    image: pgvector/pgvector:pg16
+    container_name: clawbox-postgresql
+    restart: unless-stopped
+    environment:
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+      - POSTGRES_DB=proxyclaw
+      - TZ=Asia/Shanghai
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - clawbox-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ========== Ollama (Embedding) ==========
+  ollama:
+    image: ollama/ollama:latest
+    container_name: clawbox-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - clawbox-net
+
+  # ========== OTA Agent ==========
+  ota-agent:
+    image: ${OTA_IMAGE:-clawbox/ota-agent:latest}
+    container_name: clawbox-ota
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ota_data:/opt/ota
+      - /opt/clawbox:/opt/clawbox:ro
+    environment:
+      - DEVICE_ID=${DEVICE_ID}
+      - OTA_SERVER=${OTA_SERVER:-https://ota.clawbox.ai}
+      - CURRENT_VERSION=${CLAWBOX_VERSION:-1.0.0}
+      - COMPOSE_DIR=/opt/clawbox
+    networks:
+      - clawbox-net
+
+volumes:
+  proxyclaw_data:
+  proxyclaw_logs:
+  proxyclaw_config:
+  pg_data:
+  ollama_data:
+  ota_data:
+
+networks:
+  clawbox-net:
+    driver: bridge
