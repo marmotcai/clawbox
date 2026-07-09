@@ -26,10 +26,19 @@ prepare() {
     log "Preparing build environment..."
     mkdir -p "$OUTPUT_DIR" "$WORK_DIR"
     
-    # 检查依赖
-    for cmd in debootstrap docker; do
-        command -v "$cmd" >/dev/null 2>&1 || err "$cmd not found"
-    done
+    # 检查依赖（根据构建模式）
+    case "${BUILD_MODE:-docker}" in
+        image)
+            # image 模式需要 debootstrap + docker
+            for cmd in debootstrap docker; do
+                command -v "$cmd" >/dev/null 2>&1 || err "$cmd not found"
+            done
+            ;;
+        docker)
+            # docker 模式只需要 docker
+            command -v docker >/dev/null 2>&1 || err "docker not found"
+            ;;
+    esac
 }
 
 # ========== 2. 创建最小化 rootfs ==========
@@ -243,57 +252,24 @@ build_image() {
 
 # ========== 8. Docker 镜像 (备选方案) ==========
 build_docker_image() {
-    log "Building Docker image (alternative approach)..."
+    log "Building Docker image..."
     
-    cat > "${WORK_DIR}/Dockerfile.clawbox" << 'EOF'
-FROM debian:bookworm-slim
-
-# 安装运行时依赖
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates tzdata curl bash docker.io docker-compose && \
-    rm -rf /var/lib/apt/lists/*
-
-# 时区
-RUN ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-    echo Asia/Shanghai > /etc/timezone
-
-# 复制 ClawBox 文件
-COPY docker-compose.yml /opt/clawbox/
-COPY .env.example /opt/clawbox/.env
-COPY ota/ota-agent.sh /opt/clawbox/
-COPY scripts/first-boot.sh /opt/clawbox/
-RUN chmod +x /opt/clawbox/*.sh
-
-# 复制教育 Pipeline
-COPY config/ /opt/clawbox/config/
-
-WORKDIR /opt/clawbox
-
-# 启动脚本
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
-EOF
-
-    cat > "${WORK_DIR}/entrypoint.sh" << 'EOF'
-#!/bin/bash
-set -e
-
-# 首次启动
-if [ ! -f /opt/clawbox/.setup_done ]; then
-    echo "First boot detected, running setup..."
-    /opt/clawbox/first-boot.sh --auto
-fi
-
-# 启动服务
-cd /opt/clawbox
-exec docker compose up -d
-EOF
-
-    docker build -t "clawbox:${CLAWBOX_VERSION}" -f "${WORK_DIR}/Dockerfile.clawbox" ..
+    # 获取项目根目录
+    local project_root
+    project_root="$(cd ".." && pwd)"
+    
+    # 复制 Dockerfile 到项目根目录
+    cp "${WORK_DIR}/Dockerfile.clawbox" "${project_root}/Dockerfile.clawbox"
+    cp "${WORK_DIR}/entrypoint.sh" "${project_root}/entrypoint.sh"
+    
+    # 构建 Docker 镜像
+    docker build -t "clawbox:${CLAWBOX_VERSION}" -f "${project_root}/Dockerfile.clawbox" "${project_root}"
+    
+    # 清理临时文件
+    rm -f "${project_root}/Dockerfile.clawbox" "${project_root}/entrypoint.sh"
+    
     log "Docker image built: clawbox:${CLAWBOX_VERSION}"
+    log "Run with: docker run -d -p 20060:20060 clawbox:${CLAWBOX_VERSION}"
 }
 
 # ========== 主流程 ==========
@@ -301,9 +277,20 @@ main() {
     log "ClawBox Image Builder v${CLAWBOX_VERSION}"
     echo ""
     
+    # 确定构建模式
+    BUILD_MODE="${1:-docker}"
+    
+    # macOS 不支持 image 模式，自动切换到 docker 模式
+    if [ "$BUILD_MODE" = "image" ] && [ "$(uname)" = "Darwin" ]; then
+        warn "macOS detected, image mode not available"
+        warn "Switching to docker mode..."
+        BUILD_MODE="docker"
+        echo ""
+    fi
+    
     prepare
     
-    case "${1:-docker}" in
+    case "$BUILD_MODE" in
         image)
             create_rootfs
             slim_rootfs
@@ -317,8 +304,8 @@ main() {
             ;;
         *)
             echo "Usage: $0 [image|docker]"
-            echo "  image  - Build raw disk image (requires root)"
-            echo "  docker - Build Docker image (default)"
+            echo "  image  - Build raw disk image (Linux only, requires root)"
+            echo "  docker - Build Docker image (default, works on macOS/Linux)"
             exit 1
             ;;
     esac
