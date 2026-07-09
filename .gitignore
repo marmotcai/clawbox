@@ -16,3 +16,23 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# 编译产物
+*.o
+*.a
+*.so
+*.dylib
+bin/
+
+# 日志
+*.log
+logs/
+
+# 运行时数据
+storage/
+data/
+*.db
+*.sqlite
+
+# Docker
+.docker/
