@@ -2,7 +2,11 @@
 # ============================================================
 # ClawBox 快速构建 — 一键构建系统镜像
 #
-# 用法: sudo ./quick-build.sh
+# 用法: sudo ./quick-build.sh [选项]
+#   --proxyclaw-repo   URL     GitHub 仓库地址
+#   --proxyclaw-branch BR     分支名 (默认: main)
+#   --proxyclaw-path   PATH   本地源码路径
+#   --no-proxyclaw            跳过构建，拉取远程镜像
 # ============================================================
 
 set -euo pipefail
@@ -15,6 +19,40 @@ GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# 收集传递给 build-os.sh 的参数
+BUILD_OS_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --proxyclaw-*|--no-proxyclaw)
+            BUILD_OS_ARGS+=("$1")
+            if [[ "$1" == *"="* ]]; then
+                shift
+            else
+                # 需要第二个参数
+                case $1 in
+                    --proxyclaw-repo|--proxyclaw-branch|--proxyclaw-path)
+                        BUILD_OS_ARGS+=("$2"); shift 2 ;;
+                    *)
+                        shift ;;
+                esac
+            fi
+            ;;
+        --help|-h)
+            echo "Usage: sudo $0 [选项]"
+            echo ""
+            echo "proxyclaw 构建选项:"
+            echo "  --proxyclaw-repo URL     GitHub 仓库地址"
+            echo "  --proxyclaw-branch BR    分支名 (默认: main)"
+            echo "  --proxyclaw-path PATH    本地源码路径"
+            echo "  --no-proxyclaw           跳过构建，拉取远程镜像"
+            exit 0
+            ;;
+        *)
+            shift ;;
+    esac
+done
+
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════╗"
 echo "║     🎓 ClawBox 快速构建                      ║"
@@ -25,14 +63,13 @@ echo ""
 # 检查 root
 if [[ $EUID -ne 0 ]]; then
     echo "需要 root 权限，正在提权..."
-    sudo "$0" "$@"
-    exit $?
+    exec sudo "$0" "$@"
 fi
 
 # 安装依赖
 echo -e "${GREEN}[1/3]${NC} 安装构建依赖..."
 apt-get update -qq
-apt-get install -y -qq debootstrap parted e2fsprogs grub-pc-bin grub2-common
+apt-get install -y -qq debootstrap parted e2fsprogs grub-pc-bin grub2-common git
 
 # 运行构建
 echo -e "${GREEN}[2/3]${NC} 构建系统镜像..."
@@ -40,7 +77,8 @@ cd "$SCRIPT_DIR"
 ./build-os.sh \
     --output-dir "$PROJECT_DIR/output" \
     --hostname clawbox \
-    --image-size 4G
+    --image-size 4G \
+    "${BUILD_OS_ARGS[@]}"
 
 # 完成
 echo -e "${GREEN}[3/3]${NC} 构建完成!"

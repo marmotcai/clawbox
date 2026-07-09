@@ -259,8 +259,10 @@ build_docker_image() {
     project_root="$(cd ".." && pwd)"
     
     # 复制 Dockerfile 到项目根目录
-    cp "${WORK_DIR}/Dockerfile.clawbox" "${project_root}/Dockerfile.clawbox"
-    cp "${WORK_DIR}/entrypoint.sh" "${project_root}/entrypoint.sh"
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    cp "${script_dir}/Dockerfile.clawbox" "${project_root}/Dockerfile.clawbox"
+    cp "${script_dir}/entrypoint.sh" "${project_root}/entrypoint.sh"
     
     # 构建 Docker 镜像
     docker build -t "clawbox:${CLAWBOX_VERSION}" -f "${project_root}/Dockerfile.clawbox" "${project_root}"

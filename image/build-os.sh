@@ -4,9 +4,13 @@
 # 基于 Debian 12 最小化系统，预装 Docker + proxyclaw
 # 
 # 用法: sudo ./build-os.sh [选项]
-#   --output-dir  输出目录 (默认: ./output)
-#   --image-size  镜像大小 (默认: 4G)
-#   --hostname    主机名 (默认: clawbox)
+#   --output-dir       输出目录 (默认: ./output)
+#   --image-size       镜像大小 (默认: 4G)
+#   --hostname         主机名 (默认: clawbox)
+#   --proxyclaw-repo   proxyclaw GitHub 仓库地址 (默认: https://github.com/proxyclaw/proxyclaw.git)
+#   --proxyclaw-branch proxyclaw 分支名 (默认: main)
+#   --proxyclaw-path   proxyclaw 本地源码路径 (优先级高于 --proxyclaw-repo)
+#   --no-proxyclaw     不构建 proxyclaw，直接拉取远程镜像
 # ============================================================
 
 set -euo pipefail
@@ -19,6 +23,13 @@ CLAWBOX_VERSION="${CLAWBOX_VERSION:-1.0.0}"
 WORK_DIR="./build"
 ROOTFS="${WORK_DIR}/rootfs"
 MOUNT_POINT="${WORK_DIR}/mnt"
+
+# proxyclaw 构建选项
+PROXYCLAW_REPO="https://github.com/proxyclaw/proxyclaw.git"
+PROXYCLAW_BRANCH="main"
+PROXYCLAW_LOCAL_PATH=""
+NO_PROXYCLAW=false
+PROXYCLAW_BUILD_DIR=""  # 实际使用的构建目录
 
 # 镜像名称
 TIMESTAMP=$(date +%Y%m%d)
@@ -42,11 +53,32 @@ err()   { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
-            --image-size) IMAGE_SIZE="$2"; shift 2 ;;
-            --hostname)   HOSTNAME="$2"; shift 2 ;;
+            --output-dir)       OUTPUT_DIR="$2"; shift 2 ;;
+            --image-size)       IMAGE_SIZE="$2"; shift 2 ;;
+            --hostname)         HOSTNAME="$2"; shift 2 ;;
+            --proxyclaw-repo)   PROXYCLAW_REPO="$2"; shift 2 ;;
+            --proxyclaw-branch) PROXYCLAW_BRANCH="$2"; shift 2 ;;
+            --proxyclaw-path)   PROXYCLAW_LOCAL_PATH="$2"; shift 2 ;;
+            --no-proxyclaw)     NO_PROXYCLAW=true; shift ;;
             --help|-h)
-                echo "Usage: sudo $0 [--output-dir DIR] [--image-size SIZE] [--hostname NAME]"
+                echo "Usage: sudo $0 [选项]"
+                echo ""
+                echo "基本选项:"
+                echo "  --output-dir DIR        输出目录 (默认: ./output)"
+                echo "  --image-size SIZE       镜像大小 (默认: 4G)"
+                echo "  --hostname NAME         主机名 (默认: clawbox)"
+                echo ""
+                echo "proxyclaw 构建选项:"
+                echo "  --proxyclaw-repo URL    proxyclaw GitHub 仓库地址"
+                echo "                          (默认: https://github.com/proxyclaw/proxyclaw.git)"
+                echo "  --proxyclaw-branch BR   proxyclaw 分支名 (默认: main)"
+                echo "  --proxyclaw-path PATH   proxyclaw 本地源码路径 (优先级最高)"
+                echo "  --no-proxyclaw          跳过构建，直接拉取远程镜像"
+                echo ""
+                echo "示例:"
+                echo "  sudo $0 --proxyclaw-path /path/to/proxyclaw"
+                echo "  sudo $0 --proxyclaw-branch develop"
+                echo "  sudo $0 --no-proxyclaw"
                 exit 0
                 ;;
             *) err "Unknown option: $1" ;;
@@ -347,7 +379,166 @@ deploy_clawbox() {
     log "ClawBox files deployed"
 }
 
-# ========== 7. 创建 systemd 服务 ==========
+# ========== 6.5. 构建 proxyclaw 镜像 ==========
+build_proxyclaw() {
+    if [ "$NO_PROXYCLAW" = true ]; then
+        info "Skipping proxyclaw build (--no-proxyclaw)"
+        return 0
+    fi
+
+    info "Building proxyclaw Docker image..."
+
+    # 确定构建来源: 本地路径 > GitHub 仓库
+    if [ -n "$PROXYCLAW_LOCAL_PATH" ]; then
+        # --- 从本地路径构建 ---
+        if [ ! -d "$PROXYCLAW_LOCAL_PATH" ]; then
+            err "proxyclaw local path not found: $PROXYCLAW_LOCAL_PATH"
+        fi
+        PROXYCLAW_BUILD_DIR="$PROXYCLAW_LOCAL_PATH"
+        info "Using local proxyclaw source: $PROXYCLAW_BUILD_DIR"
+
+    else
+        # --- 从 GitHub 拉取 ---
+        PROXYCLAW_BUILD_DIR="${WORK_DIR}/proxyclaw-source"
+        if [ -d "$PROXYCLAW_BUILD_DIR" ]; then
+            warn "Removing stale proxyclaw source..."
+            rm -rf "$PROXYCLAW_BUILD_DIR"
+        fi
+
+        info "Cloning proxyclaw from $PROXYCLAW_REPO (branch: $PROXYCLAW_BRANCH)..."
+        if ! git clone --depth 1 --branch "$PROXYCLAW_BRANCH" "$PROXYCLAW_REPO" "$PROXYCLAW_BUILD_DIR" 2>&1; then
+            warn "Failed to clone proxyclaw repo, falling back to remote image pull"
+            NO_PROXYCLAW=true
+            return 0
+        fi
+        log "proxyclaw source cloned"
+    fi
+
+    # 查找 Dockerfile
+    local dockerfile=""
+    if [ -f "${PROXYCLAW_BUILD_DIR}/Dockerfile" ]; then
+        dockerfile="${PROXYCLAW_BUILD_DIR}/Dockerfile"
+    elif [ -f "${PROXYCLAW_BUILD_DIR}/build/Dockerfile" ]; then
+        dockerfile="${PROXYCLAW_BUILD_DIR}/build/Dockerfile"
+    elif [ -f "${PROXYCLAW_BUILD_DIR}/docker/Dockerfile" ]; then
+        dockerfile="${PROXYCLAW_BUILD_DIR}/docker/Dockerfile"
+    else
+        # 搜索 Dockerfile
+        dockerfile=$(find "$PROXYCLAW_BUILD_DIR" -maxdepth 3 -name "Dockerfile" -not -path "*/node_modules/*" 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$dockerfile" ]; then
+        warn "No Dockerfile found in proxyclaw source, falling back to remote image pull"
+        NO_PROXYCLAW=true
+        return 0
+    fi
+
+    info "  Dockerfile: $dockerfile"
+
+    # 构建镜像
+    local build_context
+    build_context=$(dirname "$dockerfile")
+    local proxyclaw_image="proxyclaw/proxyclaw:${CLAWBOX_VERSION}"
+
+    info "  Building $proxyclaw_image ..."
+    if docker build -t "$proxyclaw_image" -t "proxyclaw/proxyclaw:latest" -f "$dockerfile" "$build_context" 2>&1; then
+        log "proxyclaw image built: $proxyclaw_image"
+
+        # 更新 .env 使用本地构建的镜像
+        sed -i "s|^PROXYCLAW_IMAGE=.*|PROXYCLAW_IMAGE=proxyclaw/proxyclaw:${CLAWBOX_VERSION}|" "${ROOTFS}/opt/clawbox/.env"
+    else
+        warn "Failed to build proxyclaw, falling back to remote image pull"
+        NO_PROXYCLAW=true
+    fi
+}
+
+# ========== 7. 预拉取 Docker 镜像（离线部署支持） ==========
+prefetch_images() {
+    info "Prefetching Docker images for offline deployment..."
+
+    local images_dir="${ROOTFS}/opt/clawbox/images"
+    mkdir -p "$images_dir"
+
+    # 读取 .env 中的镜像配置
+    local proxyclaw_img="proxyclaw/proxyclaw:latest"
+    local ota_img="clawbox/ota-agent:latest"
+    if [ -f "${ROOTFS}/opt/clawbox/.env" ]; then
+        local custom_pc
+        custom_pc=$(grep "^PROXYCLAW_IMAGE=" "${ROOTFS}/opt/clawbox/.env" | cut -d= -f2)
+        [ -n "$custom_pc" ] && proxyclaw_img="$custom_pc"
+        local custom_ota
+        custom_ota=$(grep "^OTA_IMAGE=" "${ROOTFS}/opt/clawbox/.env" | cut -d= -f2)
+        [ -n "$custom_ota" ] && ota_img="$custom_ota"
+    fi
+
+    local images=()
+    local failed_images=()
+
+    # proxyclaw: 如果本地已构建，跳过 pull 直接用 save
+    if [ "$NO_PROXYCLAW" = false ] && docker image inspect "$proxyclaw_img" >/dev/null 2>&1; then
+        info "  Using locally built $proxyclaw_img"
+        images+=("$proxyclaw_img")
+    else
+        info "  Pulling $proxyclaw_img ..."
+        if docker pull "$proxyclaw_img" 2>/dev/null; then
+            images+=("$proxyclaw_img")
+        else
+            warn "  Failed to pull $proxyclaw_img, skipping..."
+            failed_images+=("$proxyclaw_img")
+        fi
+    fi
+
+    # 其他镜像
+    local other_images=(
+        "pgvector/pgvector:pg16"
+        "ollama/ollama:latest"
+    )
+    for img in "${other_images[@]}"; do
+        info "  Pulling $img ..."
+        if docker pull "$img" 2>/dev/null; then
+            images+=("$img")
+        else
+            warn "  Failed to pull $img, skipping..."
+            failed_images+=("$img")
+        fi
+    done
+
+    # OTA agent
+    info "  Pulling $ota_img ..."
+    if docker pull "$ota_img" 2>/dev/null; then
+        images+=("$ota_img")
+    else
+        warn "  Failed to pull $ota_img, skipping..."
+        failed_images+=("$ota_img")
+    fi
+
+    if [ ${#images[@]} -eq 0 ]; then
+        warn "No Docker images were pulled, offline deployment will not work"
+        return 0
+    fi
+
+    info "  Saving ${#images[@]} images to tarball..."
+    if ! docker save "${images[@]}" -o "${images_dir}/clawbox-images.tar"; then
+        # 逐个保存（某些版本的 docker save 不支持多个参数）
+        warn "  Batch save failed, saving images individually..."
+        for img in "${images[@]}"; do
+            local safe_name
+            safe_name=$(echo "$img" | tr '/:' '_')
+            docker save "$img" -o "${images_dir}/${safe_name}.tar" 2>/dev/null || true
+        done
+    fi
+
+    if [ ${#failed_images[@]} -gt 0 ]; then
+        warn "  Some images failed: ${failed_images[*]}"
+        warn "  Offline deployment may be incomplete for: ${failed_images[*]}"
+    fi
+
+    local total_size
+    total_size=$(du -sh "$images_dir" 2>/dev/null | cut -f1 || echo "unknown")
+    log "Docker images prefetched ($total_size) for offline deployment"
+}
+
+# ========== 8. 创建 systemd 服务 ==========
 create_services() {
     info "Creating systemd services..."
     
@@ -507,10 +698,25 @@ sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=${ADMIN_PASS}/" /opt/clawbox/.env
 sed -i "s/^PG_PASSWORD=.*/PG_PASSWORD=${PG_PASS}/" /opt/clawbox/.env
 log "Passwords generated"
 
-# 3. 拉取 Docker 镜像
-log "Pulling Docker images..."
+# 3. 加载 Docker 镜像（优先本地，失败时尝试在线拉取）
+log "Loading Docker images..."
 cd /opt/clawbox
-docker compose pull 2>&1 | tee -a "$LOG"
+IMAGES_DIR="/opt/clawbox/images"
+if [ -d "$IMAGES_DIR" ]; then
+    # 逐个加载本地镜像包
+    for tar_file in "$IMAGES_DIR"/*.tar; do
+        if [ -f "$tar_file" ]; then
+            log "  Loading $(basename "$tar_file") ..."
+            docker load -i "$tar_file" 2>&1 | tee -a "$LOG" || warn "  Failed to load $(basename "$tar_file")"
+        fi
+    done
+    # 清理镜像包以释放空间
+    rm -rf "$IMAGES_DIR"
+    log "Local images loaded, image packages cleaned up"
+else
+    log "No local images found, trying online pull..."
+    docker compose pull 2>&1 | tee -a "$LOG" || log "Online pull failed, some services may not start"
+fi
 
 # 4. 启动服务
 log "Starting services..."
@@ -603,6 +809,15 @@ EOF
 
 # ========== 11. 输出信息 ==========
 show_result() {
+    local proxyclaw_info=""
+    if [ "$NO_PROXYCLAW" = true ]; then
+        proxyclaw_info="  远程镜像 (pull)"
+    elif [ -n "$PROXYCLAW_LOCAL_PATH" ]; then
+        proxyclaw_info="  本地构建: $PROXYCLAW_LOCAL_PATH"
+    elif [ -n "$PROXYCLAW_BUILD_DIR" ]; then
+        proxyclaw_info="  GitHub: $PROXYCLAW_REPO ($PROXYCLAW_BRANCH)"
+    fi
+
     echo ""
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════╗"
@@ -615,6 +830,7 @@ show_result() {
     echo "║  镜像大小:  $(du -sh "$IMAGE_FILE" | cut -f1)"
     echo "║  主机名:    ${HOSTNAME}"
     echo "║  版本:      ${CLAWBOX_VERSION}"
+    echo "║  proxyclaw: ${proxyclaw_info}"
     echo "║                                                          ║"
     echo "╠══════════════════════════════════════════════════════════╣"
     echo "║                                                          ║"
@@ -649,6 +865,8 @@ main() {
     configure_ssh
     install_docker
     deploy_clawbox
+    build_proxyclaw
+    prefetch_images
     create_services
     create_user
     setup_first_boot
