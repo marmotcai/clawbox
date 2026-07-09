@@ -50,10 +50,10 @@ create_rootfs() {
         rm -rf "$ROOTFS_DIR"
     fi
     
-    # 使用 debootstrap 创建最小系统
+    # 使用 debootstrap 创建最小系统（包含内核）
     debootstrap \
         --variant=minbase \
-        --include=systemd,systemd-sysv,dbus,openssh-server,curl,wget,ca-certificates \
+        --include=systemd,systemd-sysv,dbus,openssh-server,curl,wget,ca-certificates,linux-image-amd64,initramfs-tools \
         --exclude=e2fsprogs,busybox,kmod,plymouth \
         bookworm \
         "$ROOTFS_DIR" \
