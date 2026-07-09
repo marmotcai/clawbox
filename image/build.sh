@@ -254,13 +254,21 @@ build_image() {
 build_docker_image() {
     log "Building Docker image..."
     
+    # 获取当前脚本所在目录 (image/)
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
     # 获取项目根目录
     local project_root
-    project_root="$(cd ".." && pwd)"
+    project_root="$(cd "${script_dir}/.." && pwd)"
     
-    # 复制 Dockerfile 到项目根目录
-    cp "${WORK_DIR}/Dockerfile.clawbox" "${project_root}/Dockerfile.clawbox"
-    cp "${WORK_DIR}/entrypoint.sh" "${project_root}/entrypoint.sh"
+    log "Project root: ${project_root}"
+    log "Script dir: ${script_dir}"
+    
+    # 复制 Dockerfile 和 entrypoint 到项目根目录
+    cp "${script_dir}/Dockerfile.clawbox" "${project_root}/Dockerfile.clawbox"
+    cp "${script_dir}/entrypoint.sh" "${project_root}/entrypoint.sh"
+    chmod +x "${project_root}/entrypoint.sh"
     
     # 构建 Docker 镜像
     docker build -t "clawbox:${CLAWBOX_VERSION}" -f "${project_root}/Dockerfile.clawbox" "${project_root}"

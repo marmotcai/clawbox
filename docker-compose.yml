@@ -4,7 +4,7 @@
 services:
   # ========== proxyclaw 核心 ==========
   proxyclaw:
-    image: ${PROXYCLAW_IMAGE:-ghcr.io/marmotcai/proxyclaw-amd64:latest}
+    image: ${PROXYCLAW_IMAGE:-proxyclaw:latest}
     container_name: clawbox-proxyclaw
     restart: unless-stopped
     ports:

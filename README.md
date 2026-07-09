@@ -4,33 +4,39 @@
 
 ## 快速开始
 
-### 方式一：Docker（推荐）
+### 方式一：从源码构建（推荐）
 
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/marmotcai/ClawBox.git
 cd ClawBox
 
-# 2. 配置环境变量
+# 2. 构建 proxyclaw 镜像
+git clone https://github.com/marmotcai/proxyclaw.git
+cd proxyclaw
+./start.sh build
+cd ..
+
+# 3. 配置环境变量
 cp .env.example .env
 # 编辑 .env，填入 LLM API Key（至少一个）
 
-# 3. 启动服务
+# 4. 启动服务
 docker compose up -d
 
-# 4. 访问 Web 界面
+# 5. 访问 Web 界面
 open http://localhost:20060
 ```
 
 ### 方式二：使用预构建镜像
 
 ```bash
-# 从 GitHub Container Registry 拉取
-docker pull ghcr.io/marmotcai/proxyclaw-amd64:latest
-docker pull ollama/ollama:latest
-docker pull pgvector/pgvector:pg16
+# 如果你已经有 proxyclaw 镜像
+docker images | grep proxyclaw
 
-# 启动
+# 直接启动
+cd ClawBox
+cp .env.example .env
 docker compose up -d
 ```
 
@@ -90,7 +96,6 @@ PROXYCLAW_PORT=8080
 ClawBox/
 ├── docker-compose.yml      # 服务编排
 ├── .env.example            # 环境变量模板
-├── Dockerfile              # 系统镜像构建
 ├── README.md               # 本文档
 ├── config/
 │   └── education.yaml      # 教育场景配置
@@ -111,6 +116,32 @@ ClawBox/
 | CPU | 2 核 | 4 核 |
 | 内存 | 2GB | 4GB |
 | 存储 | 20GB | 50GB |
+
+## 故障排除
+
+### 镜像拉取失败
+
+如果 `proxyclaw:latest` 镜像不存在，需要先构建：
+
+```bash
+git clone https://github.com/marmotcai/proxyclaw.git
+cd proxyclaw
+./start.sh build
+```
+
+### 端口被占用
+
+修改 `.env` 中的端口：
+
+```bash
+PROXYCLAW_PORT=8080
+```
+
+### 查看日志
+
+```bash
+docker compose logs -f proxyclaw
+```
 
 ## 产品线
 
