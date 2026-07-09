@@ -36,3 +36,6 @@ data/
 
 # Docker
 .docker/
+
+# 环境变量
+.env
