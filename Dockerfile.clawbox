@@ -1,0 +1,31 @@
+FROM debian:bookworm-slim
+
+# 安装运行时依赖
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates tzdata curl bash sudo && \
+    rm -rf /var/lib/apt/lists/*
+
+# 时区
+RUN ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo Asia/Shanghai > /etc/timezone
+
+# 复制 ClawBox 文件
+COPY docker-compose.yml /opt/clawbox/
+COPY .env.example /opt/clawbox/.env
+COPY ota/ota-agent.sh /opt/clawbox/
+COPY scripts/first-boot.sh /opt/clawbox/
+RUN chmod +x /opt/clawbox/*.sh
+
+# 复制教育 Pipeline
+COPY config/ /opt/clawbox/config/
+
+WORKDIR /opt/clawbox
+
+# 启动脚本
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 20060
+
+ENTRYPOINT ["/entrypoint.sh"]

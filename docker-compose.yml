@@ -4,7 +4,7 @@
 services:
   # ========== proxyclaw 核心 ==========
   proxyclaw:
-    image: ${PROXYCLAW_IMAGE:-proxyclaw/proxyclaw:latest}
+    image: ${PROXYCLAW_IMAGE:-proxyclaw:latest}
     container_name: clawbox-proxyclaw
     restart: unless-stopped
     ports:
@@ -41,7 +41,6 @@ services:
     volumes:
       - proxyclaw_data:/app/storage
       - proxyclaw_logs:/app/logs
-      - proxyclaw_config:/app/config
     depends_on:
       postgresql:
         condition: service_healthy
@@ -86,27 +85,27 @@ services:
     networks:
       - clawbox-net
 
-  # ========== OTA Agent (生产部署用，本地开发可注释) ==========
-  # ota-agent:
-  #   image: ${OTA_IMAGE:-clawbox/ota-agent:latest}
-  #   container_name: clawbox-ota
-  #   restart: unless-stopped
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #     - ota_data:/opt/ota
-  #     - /opt/clawbox:/opt/clawbox:ro
-  #   environment:
-  #     - DEVICE_ID=${DEVICE_ID}
-  #     - OTA_SERVER=${OTA_SERVER:-https://ota.clawbox.ai}
-  #     - CURRENT_VERSION=${CLAWBOX_VERSION:-1.0.0}
-  #     - COMPOSE_DIR=/opt/clawbox
-  #   networks:
-  #     - clawbox-net
+  # ========== OTA Agent (本地构建，生产部署使用) ==========
+  ota-agent:
+    build:
+      context: ./ota
+      dockerfile: Dockerfile
+    container_name: clawbox-ota
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ota_data:/opt/ota
+    environment:
+      - DEVICE_ID=${DEVICE_ID}
+      - OTA_SERVER=${OTA_SERVER:-https://ota.clawbox.ai}
+      - CURRENT_VERSION=${CLAWBOX_VERSION:-1.0.0}
+      - COMPOSE_DIR=/opt/clawbox
+    networks:
+      - clawbox-net
 
 volumes:
   proxyclaw_data:
   proxyclaw_logs:
-  proxyclaw_config:
   pg_data:
   ollama_data:
   ota_data:

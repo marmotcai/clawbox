@@ -1,12 +1,12 @@
-# ClawBox — 教育 AI 服务器
+# ClawBox — AI 服务器
 
-> 开箱即用的教育 AI 服务器，为学校/培训机构提供私有化 AI 教学助手。
+> 开箱即用的 AI 服务器，支持多场景扩展（教育、医疗、办公等）。
 
 ## 产品特性
 
-- 🎓 **教育场景预置** — 作业答疑、知识点讲解、作文批改、口语练习
+- 🎓 **多场景支持** — 教育、医疗、法律、办公，按需扩展
 - 🚀 **即插即用** — 开机自动启动，5 分钟搞定
-- 🔒 **数据隐私** — 数据不出校园，满足合规要求
+- 🔒 **数据隐私** — 数据不出本地，满足合规要求
 - 💰 **省钱** — 语义缓存，相似问题不重复调用 API
 - 📦 **离线部署** — 镜像预打包所有依赖，无需联网即可部署
 - 🔄 **OTA 升级** — 远程自动更新，无需运维
@@ -18,24 +18,44 @@
 ### 方式一：Docker Compose 部署（开发/测试推荐）
 
 ```bash
-# 1. 克隆项目
-git clone <repo-url> clawbox
-cd clawbox
+# 1. 克隆仓库
+git clone https://github.com/marmotcai/ClawBox.git
+cd ClawBox
 
-# 2. 配置环境变量
+# 2. 构建 proxyclaw 镜像
+git clone https://github.com/marmotcai/proxyclaw.git
+cd proxyclaw
+./start.sh build
+cd ..
+
+# 3. 配置环境变量
 cp .env.example .env
-nano .env  # 填入 LLM API Key 和管理员密码
+# 编辑 .env，填入 LLM API Key 和管理员密码
+nano .env
 
-# 3. 启动所有服务
+# 4. 启动服务
 docker compose up -d
 
-# 4. 访问 Web 界面
+# 5. 访问 Web 界面
 open http://localhost:20060
 ```
 
 首次启动会自动拉取所需镜像（proxyclaw、PostgreSQL + pgvector、Ollama），请确保网络畅通。
 
-### 方式二：Docker 单镜像部署
+### 方式二：使用预构建镜像
+
+如果你已经构建好 proxyclaw 镜像：
+
+```bash
+docker images | grep proxyclaw
+
+# 直接启动
+cd ClawBox
+cp .env.example .env
+docker compose up -d
+```
+
+### 方式三：Docker 单镜像部署
 
 ```bash
 # 构建 Docker 镜像
@@ -45,6 +65,33 @@ cd image
 # 运行
 docker run -d -p 20060:20060 clawbox:1.0.0
 ```
+
+## 快速配置
+
+### LLM API Key
+
+编辑 `.env`，至少配置一个：
+
+```bash
+# OpenAI
+OPENAI_API_KEY=sk-xxx
+
+# DeepSeek
+DEEPSEEK_API_KEY=sk-xxx
+
+# 通义千问
+DASHSCOPE_API_KEY=sk-xxx
+```
+
+### 端口
+
+默认端口 `20060`，修改 `.env` 中的 `PROXYCLAW_PORT`：
+
+```bash
+PROXYCLAW_PORT=8080
+```
+
+
 
 ---
 
@@ -242,16 +289,28 @@ LOG_LEVEL=info
 
 ## 使用教育场景
 
-在 Web 界面的对话框中，使用快捷码进入教育模式：
+在 Web 界面中，使用快捷码进入教育模式：
 
-| 快捷码 | 场景 | 说明 |
-|--------|------|------|
-| `#edu` | 通用答疑 | 默认答疑模式 |
-| `#edu 解题` | 解题辅导 | 苏格拉底引导法 |
-| `#edu 讲解` | 概念讲解 | 生活类比+举例 |
-| `#edu 知识点` | 知识点思考 | 深度学习引导 |
-| `#edu 作文` | 作文批改 | 评分+修改建议 |
-| `#edu 口语` | 英语口语 | 对话练习+纠错 |
+| 快捷码 | 场景 |
+|--------|------|
+| `#edu` | 通用答疑 |
+| `#edu 解题` | 解题辅导 |
+| `#edu 讲解` | 概念讲解 |
+| `#edu 作文` | 作文批改 |
+| `#edu 口语` | 英语口语 |
+
+## 服务架构
+
+```
+┌─────────────────────────────────────────┐
+│  ClawBox                                │
+├─────────────────────────────────────────┤
+│  proxyclaw      :20060    LLM 网关     │
+│  PostgreSQL     :5432     数据库       │
+│  Ollama         :11434    Embedding    │
+│  OTA Agent                 远程升级     │
+└─────────────────────────────────────────┘
+```
 
 ---
 
@@ -264,16 +323,45 @@ LOG_LEVEL=info
 | 存储 | 32GB（系统） | 256GB SSD |
 | 网络 | 千兆以太网 | — |
 
+## 故障排除
+
+### 镜像拉取失败
+
+如果 `proxyclaw:latest` 镜像不存在，需要先构建：
+
+```bash
+git clone https://github.com/marmotcai/proxyclaw.git
+cd proxyclaw
+./start.sh build
+```
+
+### 端口被占用
+
+修改 `.env` 中的端口：
+
+```bash
+PROXYCLAW_PORT=8080
+```
+
+### 查看日志
+
+```bash
+docker compose logs -f proxyclaw
+```
+
 ---
 
 ## 项目结构
 
 ```
-clawbox/
+ClawBox/
 ├── docker-compose.yml       # 服务编排
 ├── Dockerfile               # Docker 镜像构建
-├── .env                     # 环境变量（需从 .env.example 复制）
+├── Dockerfile.clawbox       # Docker 单镜像构建
+├── entrypoint.sh            # Docker 容器入口
+├── .env.example             # 环境变量模板
 ├── ota/
+│   ├── Dockerfile           # OTA Agent 镜像定义
 │   └── ota-agent.sh         # OTA 升级代理
 ├── scripts/
 │   ├── first-boot.sh        # 首次启动向导
@@ -282,12 +370,21 @@ clawbox/
 │   ├── build.sh             # 主构建入口（docker/image 双模式）
 │   ├── build-os.sh          # 磁盘镜像构建（.img.gz）
 │   ├── build-iso.sh         # ISO 安装镜像构建
-│   ├── quick-build.sh       # 一键构建脚本
-│   ├── Dockerfile.clawbox   # Docker 模式使用的 Dockerfile
-│   └── entrypoint.sh        # Docker 容器入口脚本
+│   └── quick-build.sh       # 一键构建脚本
 └── config/
     └── education.yaml       # 教育场景配置
 ```
+
+---
+
+## 产品路线图
+
+| 产品 | 场景 | 状态 |
+|------|------|------|
+| ClawBox | 通用 AI 服务器 | ✅ 可用 |
+| ClawBox Edu | 教育场景 | ✅ 可用 |
+| ClawBox Med | 医疗场景 | 🔜 规划中 |
+| ClawBox Legal | 法律场景 | 🔜 规划中 |
 
 ---
 
