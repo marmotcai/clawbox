@@ -193,11 +193,12 @@ CLAWBOX_VERSION=1.0.0           # 版本号
 PROXYCLAW_PORT=20060            # Web UI 端口
 
 # 数据库
-PG_PASSWORD=clawbox_secret_2026 # PostgreSQL 密码（生产环境请修改）
+PG_PASSWORD=${PG_PASSWORD}         # 必填：PostgreSQL 密码
+                                     # 建议: openssl rand -base64 24
 
 # 管理员
-ADMIN_USERNAME=admin            # 管理员用户名
-ADMIN_PASSWORD=admin123         # 管理员密码（首次启动会自动生成随机密码）
+ADMIN_USERNAME=admin              # 管理员用户名
+ADMIN_PASSWORD=${ADMIN_PASSWORD}  # 必填：管理员密码
 
 # OTA 升级
 OTA_SERVER=https://ota.clawbox.ai
