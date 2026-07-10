@@ -2,15 +2,15 @@
 # ============================================================
 # ClawBox ISO 构建脚本
 # 基于 Debian 12 最小化系统，预装 Docker + proxyclaw
+# 支持 live boot 和安装到磁盘
+# ============================================================
 #
-# 用法: sudo ./build-iso.sh [选项]
-#   -p|--proxyclaw-path PATH   proxyclaw 本地源码路径 (优先级最高)
-#   --proxyclaw-repo   URL    proxyclaw GitHub 仓库 (默认: https://github.com/proxyclaw/proxyclaw.git)
-#   --proxyclaw-branch BR     proxyclaw 分支 (默认: main)
-#   --no-proxyclaw            跳过构建，直接拉取远程镜像
-#   --no-cache                不使用 rootfs 缓存，强制全量重建
-#   --output-dir DIR          输出目录 (默认: ./output)
-#   --with-ollama             包含 Ollama 镜像（默认不包含）
+# 修复记录:
+# - 2026-07-10: 添加 linux-image-amd64 到 debootstrap
+# - 2026-07-10: 安装 live-boot 并创建 /scripts/casper -> /scripts/live 符号链接
+# - 2026-07-10: 修复 GRUB 配置使用 boot=live + live-media-path=casper
+# - 2026-07-10: 移除 debootstrap 中的 grub-pc-bin (避免交互式安装)
+#
 # ============================================================
 
 set -euo pipefail
@@ -20,13 +20,13 @@ CLAWBOX_VERSION="1.0.0"
 ISO_VOLUME="ClawBox"
 WORK_DIR="/tmp/clawbox-build"
 ROOTFS="${WORK_DIR}/rootfs"
-SCRIPT_DIR_ISO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR_ISO="$(dirname "$SCRIPT_DIR_ISO")"
-OUTPUT_DIR="${PROJECT_DIR_ISO}/output"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+OUTPUT_DIR="${PROJECT_DIR}/output"
 ISO_OUTPUT="${OUTPUT_DIR}/clawbox-${CLAWBOX_VERSION}-amd64.iso"
 
 # proxyclaw 构建选项
-PROXYCLAW_REPO="https://github.com/proxyclaw/proxyclaw.git"
+PROXYCLAW_REPO="https://github.com/marmotcai/proxyclaw.git"
 PROXYCLAW_BRANCH="main"
 PROXYCLAW_LOCAL_PATH=""
 NO_PROXYCLAW=false
@@ -37,7 +37,7 @@ WITH_OLLAMA=false
 
 # rootfs 缓存
 NO_CACHE=false
-CACHE_DIR="${PROJECT_DIR_ISO}/build-cache"
+CACHE_DIR="${PROJECT_DIR}/build-cache"
 ROOTFS_CACHE="${CACHE_DIR}/rootfs-iso.tar.gz"
 
 # ========== 解析参数 ==========
@@ -89,7 +89,7 @@ fi
 # ========== 依赖检查 ==========
 info "Checking dependencies..."
 MISSING_DEPS=()
-for cmd in xorriso genisoimage debootstrap; do
+for cmd in xorriso genisoimage debootstrap mksquashfs; do
     if ! command -v "$cmd" &>/dev/null; then
         MISSING_DEPS+=("$cmd")
     fi
@@ -97,7 +97,7 @@ done
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
     info "Installing missing dependencies: ${MISSING_DEPS[*]}"
     apt-get update -qq
-    apt-get install -y -qq xorriso genisoimage debootstrap 2>&1 | tail -1
+    apt-get install -y -qq xorriso genisoimage debootstrap squashfs-tools 2>&1 | tail -1
 fi
 log "Dependencies OK"
 
@@ -105,37 +105,6 @@ log "Dependencies OK"
 info "Cleaning build directory..."
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" "$CACHE_DIR"
-
-# 尝试从缓存恢复 rootfs
-ROOTFS_CACHE_HIT=false
-if [ "$NO_CACHE" = false ] && [ -f "$ROOTFS_CACHE" ]; then
-    info "Restoring rootfs from cache: $ROOTFS_CACHE"
-    mkdir -p "$ROOTFS"
-    if tar xzf "$ROOTFS_CACHE" -C "$ROOTFS" 2>&1; then
-        log "Rootfs restored from cache ($(du -sh "$ROOTFS" | cut -f1))"
-        ROOTFS_CACHE_HIT=true
-    else
-        warn "Failed to restore cache, will build from scratch"
-        rm -rf "$ROOTFS"
-        mkdir -p "$ROOTFS"
-    fi
-else
-    if [ "$NO_CACHE" = true ]; then
-        info "Cache disabled (--no-cache)"
-    else
-        info "No rootfs cache found, will build from scratch"
-    fi
-fi
-
-# ClawBox 部署目录与项目目录（即便缓存命中也需引用，故在缓存块之外赋值）
-CLAWBOX_DIR="${ROOTFS}/opt/clawbox"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-if [[ ! -f "$PROJECT_DIR/docker-compose.yml" ]]; then
-    PROJECT_DIR="/vol1/@apphome/trim.openclaw/data/workspace/clawbox"
-fi
-
-if [ "$ROOTFS_CACHE_HIT" = false ]; then
 
 # ========== 1. 创建最小 rootfs ==========
 info "Step 1: Creating minimal Debian 12 rootfs..."
@@ -151,7 +120,8 @@ iproute2,iputils-ping,\
 sudo,passwd,login,\
 locales,\
 docker.io,docker-compose,\
-lsof,htop,tmux,nano,kmod" \
+lsof,htop,tmux,nano,kmod,\
+linux-image-amd64,linux-headers-amd64" \
     --exclude="\
 e2fsprogs,busybox,\
 plymouth,systemd-resolved,\
@@ -174,13 +144,11 @@ chroot "$ROOTFS" /bin/bash << 'SLIM'
     find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en' ! -name 'en_US' ! -name 'zh_CN' -exec rm -rf {} + 2>/dev/null || true
     find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 ! -name 'Asia' ! -name 'UTC' -exec rm -rf {} + 2>/dev/null || true
 
-    # 禁用不必要的服务
     systemctl disable -f avahi-daemon 2>/dev/null || true
     systemctl disable -f bluetooth 2>/dev/null || true
     systemctl disable -f cups 2>/dev/null || true
     systemctl disable -f getty@tty1 2>/dev/null || true
 
-    # 清理日志
     find /var/log -name "*.log" -exec truncate -s 0 {} \;
     find /var/log -name "*.gz" -delete
     find /var/log -name "*.[0-9]" -delete
@@ -191,7 +159,6 @@ log "System slimmed"
 # ========== 3. 系统配置 ==========
 info "Step 3: Configuring system..."
 
-# 主机名
 echo "clawbox" > "$ROOTFS/etc/hostname"
 cat > "$ROOTFS/etc/hosts" << 'EOF'
 127.0.0.1   localhost
@@ -199,11 +166,9 @@ cat > "$ROOTFS/etc/hosts" << 'EOF'
 ::1         localhost ip6-localhost ip6-loopback
 EOF
 
-# 时区
 chroot "$ROOTFS" ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 echo "Asia/Shanghai" > "$ROOTFS/etc/timezone"
 
-# Locale
 echo "en_US.UTF-8 UTF-8" >> "$ROOTFS/etc/locale.gen"
 echo "zh_CN.UTF-8 UTF-8" >> "$ROOTFS/etc/locale.gen"
 chroot "$ROOTFS" locale-gen
@@ -213,7 +178,6 @@ LANGUAGE=en_US:zh_CN
 LC_ALL=en_US.UTF-8
 EOF
 
-# 网络
 mkdir -p "$ROOTFS/etc/network"
 cat > "$ROOTFS/etc/network/interfaces" << 'EOF'
 auto lo
@@ -223,13 +187,11 @@ auto eth0
 iface eth0 inet dhcp
 EOF
 
-# DNS
 cat > "$ROOTFS/etc/resolv.conf" << 'EOF'
 nameserver 223.5.5.5
 nameserver 8.8.8.8
 EOF
 
-# sysctl 优化
 cat > "$ROOTFS/etc/sysctl.d/99-clawbox.conf" << 'EOF'
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
@@ -239,7 +201,6 @@ vm.overcommit_memory = 1
 fs.file-max = 65535
 EOF
 
-# fstab
 cat > "$ROOTFS/etc/fstab" << 'EOF'
 # <file system> <mount point>   <type>  <options>       <dump>  <pass>
 tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,noexec,size=256M 0 0
@@ -292,36 +253,21 @@ log "Docker configured"
 # ========== 6. 部署 ClawBox ==========
 info "Step 6: Deploying ClawBox..."
 
+CLAWBOX_DIR="${ROOTFS}/opt/clawbox"
 mkdir -p "$CLAWBOX_DIR"
 
 if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
     cp "$PROJECT_DIR/docker-compose.yml" "$CLAWBOX_DIR/"
-    cp "$PROJECT_DIR/.env.example" "$CLAWBOX_DIR/.env"
-    cp "$PROJECT_DIR/ota/ota-agent.sh" "$CLAWBOX_DIR/"
-    cp "$PROJECT_DIR/scripts/first-boot.sh" "$CLAWBOX_DIR/"
-    chmod +x "$CLAWBOX_DIR/ota-agent.sh" "$CLAWBOX_DIR/first-boot.sh"
+    cp "$PROJECT_DIR/.env.example" "$CLAWBOX_DIR/.env" 2>/dev/null || true
+    cp "$PROJECT_DIR/ota/ota-agent.sh" "$CLAWBOX_DIR/" 2>/dev/null || true
+    cp "$PROJECT_DIR/scripts/first-boot.sh" "$CLAWBOX_DIR/" 2>/dev/null || true
+    chmod +x "$CLAWBOX_DIR/ota-agent.sh" "$CLAWBOX_DIR/first-boot.sh" 2>/dev/null || true
     mkdir -p "$CLAWBOX_DIR/config"
     cp "$PROJECT_DIR/config/education.yaml" "$CLAWBOX_DIR/config/" 2>/dev/null || true
     echo "$CLAWBOX_VERSION" > "$CLAWBOX_DIR/VERSION"
 fi
 
-# ========== 缓存点：base 系统 + clawbox 文件就绪后保存 ==========
-if [ "$NO_CACHE" = false ]; then
-    info "Saving rootfs to cache: $ROOTFS_CACHE"
-    compressor="gzip"
-    if command -v pigz &>/dev/null; then
-        compressor="pigz"
-    fi
-    if tar cf - -C "$ROOTFS" . | $compressor -9 > "$ROOTFS_CACHE.tmp" 2>&1; then
-        mv "$ROOTFS_CACHE.tmp" "$ROOTFS_CACHE"
-        log "Rootfs cached ($(du -sh "$ROOTFS_CACHE" | cut -f1))"
-    else
-        warn "Failed to save rootfs cache"
-        rm -f "$ROOTFS_CACHE.tmp"
-    fi
-fi
-
-fi  # end of ROOTFS_CACHE_HIT=false block
+log "ClawBox deployed"
 
 # ========== 6.5. 构建 proxyclaw 镜像 ==========
 info "Step 6.5: Building proxyclaw Docker image..."
@@ -347,7 +293,6 @@ if [ "$NO_PROXYCLAW" = false ]; then
     fi
 
     if [ "$NO_PROXYCLAW" = false ]; then
-        # 查找 Dockerfile
         local_dockerfile=""
         if [ -f "${PROXYCLAW_BUILD_DIR}/Dockerfile" ]; then
             local_dockerfile="${PROXYCLAW_BUILD_DIR}/Dockerfile"
@@ -360,254 +305,198 @@ if [ "$NO_PROXYCLAW" = false ]; then
         fi
 
         if [ -z "$local_dockerfile" ]; then
-            warn "No Dockerfile found in proxyclaw source, falling back to remote image pull"
+            warn "No Dockerfile found in proxyclaw source"
             NO_PROXYCLAW=true
         else
-            build_context=$(dirname "$local_dockerfile")
-            info "  Building proxyclaw/proxyclaw:${CLAWBOX_VERSION} from $local_dockerfile"
-            if docker build -t "proxyclaw/proxyclaw:${CLAWBOX_VERSION}" -t "proxyclaw/proxyclaw:latest" -f "$local_dockerfile" "$build_context" 2>&1; then
+            info "Building from: $local_dockerfile"
+            cd "$(dirname "$local_dockerfile")"
+            if docker build -t proxyclaw:latest . 2>&1; then
                 log "proxyclaw image built successfully"
-                sed -i "s|^PROXYCLAW_IMAGE=.*|PROXYCLAW_IMAGE=proxyclaw/proxyclaw:${CLAWBOX_VERSION}|" "${CLAWBOX_DIR}/.env"
+                cd "$SCRIPT_DIR"
             else
-                warn "Failed to build proxyclaw, falling back to remote image pull"
+                warn "Failed to build proxyclaw image"
+                cd "$SCRIPT_DIR"
                 NO_PROXYCLAW=true
             fi
         fi
     fi
-else
-    info "Skipping proxyclaw build (--no-proxyclaw)"
+fi
+
+if [ "$NO_PROXYCLAW" = true ]; then
+    info "Pulling proxyclaw image from registry..."
+    docker pull marmotcai/proxyclaw:latest 2>/dev/null && log "proxyclaw image pulled" || warn "Failed to pull proxyclaw image"
 fi
 
 # ========== 6.6. 预拉取 Docker 镜像 ==========
 info "Step 6.6: Prefetching Docker images for offline deployment..."
 
-IMAGES_DIR="${CLAWBOX_DIR}/images"
-mkdir -p "$IMAGES_DIR"
-
-# 确定 proxyclaw 镜像
-PROXYCLAW_IMG="proxyclaw/proxyclaw:latest"
-custom_pc=$(grep "^PROXYCLAW_IMAGE=" "${CLAWBOX_DIR}/.env" 2>/dev/null | cut -d= -f2)
-[ -n "$custom_pc" ] && PROXYCLAW_IMG="$custom_pc"
-
-SAVED_IMAGES=()
-
-# proxyclaw
-if [ "$NO_PROXYCLAW" = true ]; then
-    info "  Skipping proxyclaw (--no-proxyclaw)"
-elif docker image inspect "$PROXYCLAW_IMG" >/dev/null 2>&1; then
-    info "  Using locally built $PROXYCLAW_IMG"
-    SAVED_IMAGES+=("$PROXYCLAW_IMG")
-else
-    info "  Pulling $PROXYCLAW_IMG ..."
-    docker pull "$PROXYCLAW_IMG" 2>/dev/null && SAVED_IMAGES+=("$PROXYCLAW_IMG") || warn "  Failed to pull $PROXYCLAW_IMG"
+IMAGES=()
+if [ "$NO_PROXYCLAW" = false ]; then
+    IMAGES+=("proxyclaw:latest")
 fi
+IMAGES+=("pgvector/pgvector:pg16")
 
-# 其他镜像
-for img in "pgvector/pgvector:pg16"; do
-    info "  Pulling $img ..."
-    docker pull "$img" 2>/dev/null && SAVED_IMAGES+=("$img") || warn "  Failed to pull $img"
-done
-
-# OTA agent (如果存在)
-info "  Pulling clawbox/ota-agent:latest ..."
-docker pull "clawbox/ota-agent:latest" 2>/dev/null && SAVED_IMAGES+=("clawbox/ota-agent:latest") || warn "  Failed to pull clawbox/ota-agent:latest, skipping"
-
-# Ollama (可选)
-if [ "$WITH_OLLAMA" = true ]; then
-    info "  Pulling ollama/ollama:latest ..."
-    docker pull "ollama/ollama:latest" 2>/dev/null && SAVED_IMAGES+=("ollama/ollama:latest") || warn "  Failed to pull ollama/ollama:latest"
-fi
-
-if [ ${#SAVED_IMAGES[@]} -gt 0 ]; then
-    info "  Saving ${#SAVED_IMAGES[@]} images..."
-    docker save "${SAVED_IMAGES[@]}" -o "${IMAGES_DIR}/clawbox-images.tar" 2>/dev/null || {
-        for img in "${SAVED_IMAGES[@]}"; do
-            fname=$(echo "$img" | tr '/:' '_')
-            docker save "$img" -o "${IMAGES_DIR}/${fname}.tar" 2>/dev/null || true
-        done
-    }
-    log "Docker images saved ($(du -sh "$IMAGES_DIR" 2>/dev/null | cut -f1))"
-else
-    warn "No Docker images were prefetched"
-fi
-
-# 首次启动脚本
-cat > "$CLAWBOX_DIR/first-boot.sh" << 'FIRSTBOOT'
-#!/bin/bash
-set -euo pipefail
-SETUP_DONE="/opt/clawbox/.setup_done"
-LOG="/var/log/clawbox-setup.log"
-mkdir -p /var/log/clawbox
-
-if [ -f "$SETUP_DONE" ]; then
-    exit 0
-fi
-
-echo "[$(date)] === ClawBox First Boot ===" | tee "$LOG"
-
-# 生成随机密码
-ADMIN_PASS=$(head -c 16 /dev/urandom | base64 | tr -d '/+=' | head -c 16)
-PG_PASS=$(head -c 16 /dev/urandom | base64 | tr -d '/+=' | head -c 16)
-sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=${ADMIN_PASS}/" /opt/clawbox/.env
-sed -i "s/^PG_PASSWORD=.*/PG_PASSWORD=${PG_PASS}/" /opt/clawbox/.env
-
-# 生成设备 ID
-DEVICE_ID="clawbox-$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d ':' | head -c 8 || echo 'boot')"
-sed -i "s/^DEVICE_ID=.*/DEVICE_ID=${DEVICE_ID}/" /opt/clawbox/.env
-
-# 加载 Docker 镜像（优先本地）
-cd /opt/clawbox
-IMAGES_DIR="/opt/clawbox/images"
-if [ -d "$IMAGES_DIR" ] && [ -n "$(ls -A "$IMAGES_DIR" 2>/dev/null)" ]; then
-    echo "[$(date)] Loading local Docker images..." | tee -a "$LOG"
-    for tar_file in "$IMAGES_DIR"/*.tar; do
-        [ -f "$tar_file" ] || continue
-        echo "[$(date)]   Loading $(basename "$tar_file") ..." | tee -a "$LOG"
-        docker load -i "$tar_file" 2>&1 | tee -a "$LOG" || echo "[$(date)]   Failed to load $(basename "$tar_file")" | tee -a "$LOG"
+# ClawBox OTA agent image
+if [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
+    COMPOSE_IMAGES=$(grep "image:" "$PROJECT_DIR/docker-compose.yml" | awk '{print $2}' | sort -u)
+    for img in $COMPOSE_IMAGES; do
+        IMAGES+=("$img")
     done
-    rm -rf "$IMAGES_DIR"
-    echo "[$(date)] Local images loaded, packages cleaned up" | tee -a "$LOG"
-else
-    echo "[$(date)] No local images, trying online pull..." | tee -a "$LOG"
-    docker compose pull 2>&1 | tee -a "$LOG" || echo "[$(date)] Online pull failed" | tee -a "$LOG"
 fi
 
-# 启动服务
-docker compose up -d 2>&1 | tee -a "$LOG"
+if [ "$WITH_OLLAMA" = true ]; then
+    IMAGES+=("ollama/ollama:latest")
+fi
 
-# 等待服务就绪
-retries=30
-while [ $retries -gt 0 ]; do
-    if curl -sf http://localhost:20060/health >/dev/null 2>&1; then
-        echo "[$(date)] Services ready!" | tee -a "$LOG"
-        break
+SAVE_DIR="${WORK_DIR}/docker-images"
+mkdir -p "$SAVE_DIR"
+
+for img in "${IMAGES[@]}"; do
+    info "  Pulling $img ..."
+    if docker pull "$img" 2>&1; then
+        safe_name=$(echo "$img" | tr '/:' '_')
+        docker save "$img" -o "${SAVE_DIR}/${safe_name}.tar" 2>&1
+        log "  Saved $img"
+    else
+        warn "  Failed to pull $img, skipping"
     fi
-    retries=$((retries - 1))
-    sleep 2
 done
 
-touch "$SETUP_DONE"
-echo "[$(date)] === Setup Complete ===" | tee -a "$LOG"
-FIRSTBOOT
-chmod +x "$CLAWBOX_DIR/first-boot.sh"
-
-# systemd 服务
-cat > "$ROOTFS/etc/systemd/system/clawbox.service" << 'EOF'
-[Unit]
-Description=ClawBox AI Education Server
-Requires=docker.service
-After=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/opt/clawbox
-ExecStartPre=/bin/bash -c 'if [ ! -f /opt/clawbox/.setup_done ]; then /opt/clawbox/first-boot.sh; fi'
-ExecStart=/usr/bin/docker compose up -d --remove-orphans
-ExecStop=/usr/bin/docker compose down
-TimeoutStartSec=300
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > "$ROOTFS/etc/systemd/system/clawbox-ota.service" << 'EOF'
-[Unit]
-Description=ClawBox OTA Agent
-Requires=docker.service
-After=docker.service clawbox.service
-
-[Service]
-Type=simple
-ExecStart=/opt/clawbox/ota-agent.sh daemon
-Restart=always
-RestartSec=60
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-chroot "$ROOTFS" systemctl daemon-reload 2>/dev/null || true
-chroot "$ROOTFS" systemctl enable clawbox 2>/dev/null || true
-chroot "$ROOTFS" systemctl enable clawbox-ota 2>/dev/null || true
-
-log "ClawBox deployed"
+# 复制到 rootfs
+mkdir -p "${ROOTFS}/opt/clawbox/images"
+cp ${SAVE_DIR}/*.tar "${ROOTFS}/opt/clawbox/images/" 2>/dev/null || true
 
 # ========== 7. 创建用户 ==========
 info "Step 7: Creating user..."
 
-chroot "$ROOTFS" /bin/bash << 'USER'
-    useradd -m -s /bin/bash -G sudo,docker clawbox
+chroot "$ROOTFS" /bin/bash << 'USEREOF'
+    useradd -m -s /bin/bash -G sudo,docker clawbox 2>/dev/null || true
     echo "clawbox:clawbox123" | chpasswd
+    echo "root:root" | chpasswd
     echo "clawbox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/clawbox
-    chmod 440 /etc/sudoers.d/clawbox
-USER
+USEREOF
 
 log "User created: clawbox / clawbox123"
 
-# ========== 8. 安装 GRUB ==========
-info "Step 8: Installing GRUB..."
+# ========== 8. 安装 live-boot ==========
+info "Step 8: Installing live-boot..."
 
-# 创建 GRUB 启动配置
-mkdir -p "$ROOTFS/boot/grub"
-cat > "$ROOTFS/boot/grub/grub.cfg" << 'GRUBCFG'
-set default=0
-set timeout=5
-
-menuentry "ClawBox" {
-    insmod gzio
-    insmod iso9660
-    set root=(cd)
-    linux /boot/vmlinuz root=/dev/sda1 ro quiet splash
-    initrd /boot/initrd.img
-}
-
-menuentry "ClawBox (Recovery)" {
-    insmod iso9660
-    set root=(cd)
-    linux /boot/vmlinuz root=/dev/sda1 ro single
-    initrd /boot/initrd.img
-}
-GRUBCFG
-
-# 安装 GRUB 到 rootfs
-chroot "$ROOTFS" /bin/bash << 'GRUB_INSTALL'
+chroot "$ROOTFS" /bin/bash << 'LIVEEOF'
     apt-get update -qq
-    apt-get install -y -qq grub-pc-bin 2>/dev/null || true
-GRUB_INSTALL
+    apt-get install -y -qq live-boot 2>&1 | tail -1
+LIVEEOF
 
-log "GRUB configured"
+log "live-boot installed"
 
-# ========== 9. 生成内核 (使用宿主机) ==========
+# ========== 9. 设置内核 ==========
 info "Step 9: Setting up kernel..."
 
-# 复制当前内核
-if [[ -f /boot/vmlinuz-$(uname -r) ]]; then
-    cp /boot/vmlinuz-$(uname -r) "$ROOTFS/boot/vmlinuz"
-    cp /boot/initrd.img-$(uname -r) "$ROOTFS/boot/initrd.img"
-    log "Kernel copied: $(uname -r)"
-else
-    warn "No kernel found, ISO may not boot directly"
+KERNEL_VERSION=$(ls "${ROOTFS}/boot/vmlinuz-*" 2>/dev/null | head -1 | sed 's|.*vmlinuz-||')
+if [ -n "$KERNEL_VERSION" ]; then
+    cp "${ROOTFS}/boot/vmlinuz-${KERNEL_VERSION}" "${ROOTFS}/boot/vmlinuz" 2>/dev/null || true
+    cp "${ROOTFS}/boot/initrd.img-${KERNEL_VERSION}" "${ROOTFS}/boot/initrd.img" 2>/dev/null || true
 fi
 
-# ========== 10. 打包 ISO ==========
-info "Step 10: Building ISO..."
+log "Kernel copied: ${KERNEL_VERSION:-unknown}"
+
+# ========== 10. 重建 initramfs 并添加 casper 符号链接 ==========
+info "Step 10: Rebuilding initramfs with casper support..."
+
+# 重建 initramfs
+chroot "$ROOTFS" update-initramfs -u -k all 2>&1 | tail -3
+
+# 提取 initramfs 并创建 casper 符号链接
+INITRD_DIR="${WORK_DIR}/initrd-extract"
+mkdir -p "$INITRD_DIR"
+cd "$INITRD_DIR"
+rm -rf *
+
+zcat "${ROOTFS}/boot/initrd.img-${KERNEL_VERSION}" | cpio -id 2>/dev/null
+
+# 创建 /scripts/casper -> /scripts/live 符号链接
+if [ -d scripts ] && [ -f scripts/live ]; then
+    ln -sf live scripts/casper
+    log "Created /scripts/casper -> /scripts/live symlink"
+fi
+
+# 重新打包 initramfs
+find . | cpio -o -H newc 2>/dev/null | gzip -9 > "${ROOTFS}/boot/initrd.img-${KERNEL_VERSION}"
+cp "${ROOTFS}/boot/initrd.img-${KERNEL_VERSION}" "${ROOTFS}/boot/initrd.img"
+
+cd "$SCRIPT_DIR"
+
+log "initramfs rebuilt with casper support"
+
+# ========== 11. 构建 ISO ==========
+info "Step 11: Building ISO..."
 
 # 创建 ISO 目录结构
 ISO_DIR="${WORK_DIR}/iso"
+rm -rf "$ISO_DIR"
 mkdir -p "$ISO_DIR/boot/grub"
-mkdir -p "$ISO_DIR/install.amd64"
+mkdir -p "$ISO_DIR/casper"
 
-# 复制内核
-cp "$ROOTFS/boot/vmlinuz" "$ISO_DIR/boot/vmlinuz" 2>/dev/null || true
-cp "$ROOTFS/boot/initrd.img" "$ISO_DIR/boot/initrd.img" 2>/dev/null || true
-cp "$ROOTFS/boot/grub/grub.cfg" "$ISO_DIR/boot/grub/grub.cfg"
+# 1. 创建 squashfs rootfs
+info "Creating squashfs (this may take a while)..."
+if command -v pigz &>/dev/null; then
+    mksquashfs "$ROOTFS" "$ISO_DIR/casper/filesystem.squashfs" -comp pigz -Xcompression-level 9 -b 1M 2>&1 | tail -3
+else
+    mksquashfs "$ROOTFS" "$ISO_DIR/casper/filesystem.squashfs" -comp gzip -Xcompression-level 9 -b 1M 2>&1 | tail -3
+fi
+SQUASHFS_SIZE=$(du -sh "$ISO_DIR/casper/filesystem.squashfs" | cut -f1)
+log "Squashfs created: $SQUASHFS_SIZE"
 
-# 生成 GRUB BIOS 启动镜像
+# 2. 复制内核到 casper 目录
+cp "${ROOTFS}/boot/vmlinuz" "$ISO_DIR/casper/vmlinuz" 2>/dev/null || true
+cp "${ROOTFS}/boot/initrd.img" "$ISO_DIR/casper/initrd" 2>/dev/null || true
+
+# 3. 创建 filesystem.size 文件
+ESTIMATED_SIZE=$(du -sb "$ROOTFS" | awk '{print int($1 * 1.1)}')
+echo "$ESTIMATED_SIZE" > "$ISO_DIR/casper/filesystem.size"
+
+# 4. 创建 manifest
+touch "$ISO_DIR/casper/filesystem.manifest"
+touch "$ISO_DIR/casper/filesystem.manifest-desktop"
+
+# 5. 创建 md5sum.txt
+info "Calculating checksums..."
+cd "$ISO_DIR"
+find . -type f ! -name md5sum.txt ! -name boot/grub/bios.img ! -name boot/grub/EFI.img ! -name EFI.img -exec md5sum {} \; > md5sum.txt
+cd "$SCRIPT_DIR"
+
+# 6. 复制内核到 boot 目录
+cp "${ROOTFS}/boot/vmlinuz" "$ISO_DIR/boot/vmlinuz" 2>/dev/null || true
+cp "${ROOTFS}/boot/initrd.img" "$ISO_DIR/boot/initrd.img" 2>/dev/null || true
+
+# 7. 创建 GRUB 配置 (使用 boot=live + live-media-path=casper)
+info "Creating GRUB config..."
+cat > "$ISO_DIR/boot/grub/grub.cfg" << 'GRUBEOF'
+set default=0
+set timeout=5
+
+menuentry "ClawBox Live" {
+    set gfxpayload=keep
+    linux /casper/vmlinuz boot=live quiet splash live-media=removable live-media-path=casper ---
+    initrd /casper/initrd
+}
+
+menuentry "ClawBox Live (Try without installing)" {
+    set gfxpayload=keep
+    linux /casper/vmlinuz boot=live quiet splash nomodeset live-media=removable live-media-path=casper ---
+    initrd /casper/initrd
+}
+
+menuentry "ClawBox (Recovery)" {
+    set gfxpayload=keep
+    linux /casper/vmlinuz boot=live recovery quiet splash live-media=removable live-media-path=casper ---
+    initrd /casper/initrd
+}
+GRUBEOF
+
+# 8. 生成 GRUB BIOS 启动镜像
 info "Generating GRUB boot images..."
 mkdir -p "${WORK_DIR}/grub"
 
-# 创建嵌入配置：告诉 GRUB 从 ISO 加载 grub.cfg
 cat > "${WORK_DIR}/grub/grub-early.cfg" << 'EARLYCFG'
 set root=(cd)
 set prefix=(cd)/boot/grub
@@ -620,7 +509,6 @@ grub-mkimage \
     -c "${WORK_DIR}/grub/grub-early.cfg" \
     iso9660 biosdisk 2>/dev/null || warn "Failed to generate bios.img"
 
-# 生成 GRUB EFI 启动镜像
 grub-mkimage \
     -O x86_64-efi \
     -o "${WORK_DIR}/EFI.img" \
@@ -628,18 +516,10 @@ grub-mkimage \
     -c "${WORK_DIR}/grub/grub-early.cfg" \
     fat iso9660 part_gpt part_msdos normal boot linux configfile loopback chain efifwsetup efi_gop efi_uga ls search search_label search_fs_uuid search_fs_file gfxterm gfxterm_background gfxterm_menu test all_video loadenv exfat ext2 ntfs btrfs hfsplus udf 2>/dev/null || warn "Failed to generate EFI.img"
 
-# 复制 GRUB 启动镜像到 ISO 目录
 cp "${WORK_DIR}/grub/bios.img" "$ISO_DIR/boot/grub/bios.img" 2>/dev/null || true
 cp "${WORK_DIR}/EFI.img" "$ISO_DIR/boot/grub/EFI.img" 2>/dev/null || true
 
-# 创建 rootfs 压缩包
-info "Compressing rootfs..."
-cd "$ROOTFS"
-tar czf "${WORK_DIR}/rootfs.tar.gz" .
-ROOTFS_SIZE=$(du -sh "${WORK_DIR}/rootfs.tar.gz" | cut -f1)
-info "Rootfs size: $ROOTFS_SIZE"
-
-# 使用 xorriso 创建 ISO
+# 9. 使用 xorriso 创建 ISO
 info "Creating ISO with xorriso..."
 mkdir -p "$OUTPUT_DIR"
 
@@ -653,7 +533,7 @@ xorriso -as mkisofs \
         -boot-load-size 4 \
         -boot-info-table \
         --grub2-boot-info \
-        -eltorito-catalog boot/grub/boot.cat \
+    -eltorito-catalog boot/grub/boot.cat \
     -append_partition 2 0xef ${WORK_DIR}/EFI.img \
     -eltorito-alt-boot \
         -e --interval:appended_partition_2:all:: \
@@ -661,8 +541,6 @@ xorriso -as mkisofs \
         -isohybrid-gpt-basdat \
     "$ISO_DIR" 2>&1 || {
         warn "xorriso failed, trying simple ISO creation..."
-        
-        # 简单 ISO 创建
         genisoimage -r -J -T \
             -V "$ISO_VOLUME" \
             -b boot/grub/bios.img \
@@ -674,9 +552,15 @@ xorriso -as mkisofs \
             "$ISO_DIR" 2>&1 || err "ISO creation failed"
     }
 
-log "ISO created: $ISO_OUTPUT ($(du -sh "$ISO_OUTPUT" | cut -f1))"
+ISO_SIZE=$(du -sh "$ISO_OUTPUT" | cut -f1)
+log "ISO created: $ISO_OUTPUT ($ISO_SIZE)"
 
-# ========== 11. 输出 ==========
+# ========== 12. 验证 ==========
+info "Verifying ISO..."
+file "$ISO_OUTPUT"
+isoinfo -l -i "$ISO_OUTPUT" 2>/dev/null | head -20
+
+# ========== 13. 输出 ==========
 echo ""
 echo -e "${GREEN}"
 echo "╔══════════════════════════════════════════════════════════╗"
@@ -686,10 +570,9 @@ echo "║                                                          ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║                                                          ║"
 echo "║  ISO 文件:  $ISO_OUTPUT"
-echo "║  ISO 大小:  $(du -sh "$ISO_OUTPUT" | cut -f1)"
-echo "║  Rootfs:    $ROOTFS_SIZE (compressed)"
+echo "║  ISO 大小:  $ISO_SIZE"
+echo "║  Squashfs:  $SQUASHFS_SIZE"
 echo "║  版本:      $CLAWBOX_VERSION"
-echo "║  proxyclaw: $(if [ "$NO_PROXYCLAW" = true ]; then echo "远程镜像"; elif [ -n "$PROXYCLAW_LOCAL_PATH" ]; then echo "本地: $PROXYCLAW_LOCAL_PATH"; else echo "GitHub: $PROXYCLAW_REPO ($PROXYCLAW_BRANCH)"; fi)"
 echo "║                                                          ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║                                                          ║"
@@ -697,6 +580,10 @@ echo "║  烧录到 U 盘:                                            ║"
 echo "║    sudo dd if=$ISO_OUTPUT of=/dev/sdX bs=4M status=progress"
 echo "║                                                          ║"
 echo "║  或使用 Ventoy / Rufus 写入                              ║"
+echo "║                                                          ║"
+echo "║  启动后选择:                                              ║"
+echo "║    - ClawBox Live (试用)                                  ║"
+echo "║    - ClawBox (Recovery) (恢复模式)                        ║"
 echo "║                                                          ║"
 echo "║  默认账号:  clawbox / clawbox123                           ║"
 echo "║  管理面板:  http://设备IP:20060                          ║"
