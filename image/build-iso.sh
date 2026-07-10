@@ -4,10 +4,13 @@
 # 基于 Debian 12 最小化系统，预装 Docker + proxyclaw
 #
 # 用法: sudo ./build-iso.sh [选项]
+#   -p|--proxyclaw-path PATH   proxyclaw 本地源码路径 (优先级最高)
 #   --proxyclaw-repo   URL    proxyclaw GitHub 仓库 (默认: https://github.com/proxyclaw/proxyclaw.git)
 #   --proxyclaw-branch BR     proxyclaw 分支 (默认: main)
-#   --proxyclaw-path   PATH   proxyclaw 本地源码路径 (优先级最高)
 #   --no-proxyclaw            跳过构建，直接拉取远程镜像
+#   --no-cache                不使用 rootfs 缓存，强制全量重建
+#   --output-dir DIR          输出目录 (默认: ./output)
+#   --with-ollama             包含 Ollama 镜像（默认不包含）
 # ============================================================
 
 set -euo pipefail
@@ -17,7 +20,10 @@ CLAWBOX_VERSION="1.0.0"
 ISO_VOLUME="ClawBox"
 WORK_DIR="/tmp/clawbox-build"
 ROOTFS="${WORK_DIR}/rootfs"
-ISO_OUTPUT="${WORK_DIR}/clawbox-${CLAWBOX_VERSION}-amd64.iso"
+SCRIPT_DIR_ISO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR_ISO="$(dirname "$SCRIPT_DIR_ISO")"
+OUTPUT_DIR="${PROJECT_DIR_ISO}/output"
+ISO_OUTPUT="${OUTPUT_DIR}/clawbox-${CLAWBOX_VERSION}-amd64.iso"
 
 # proxyclaw 构建选项
 PROXYCLAW_REPO="https://github.com/proxyclaw/proxyclaw.git"
@@ -26,21 +32,37 @@ PROXYCLAW_LOCAL_PATH=""
 NO_PROXYCLAW=false
 PROXYCLAW_BUILD_DIR=""
 
+# 可选组件
+WITH_OLLAMA=false
+
+# rootfs 缓存
+NO_CACHE=false
+CACHE_DIR="${PROJECT_DIR_ISO}/build-cache"
+ROOTFS_CACHE="${CACHE_DIR}/rootfs-iso.tar.gz"
+
 # ========== 解析参数 ==========
 while [[ $# -gt 0 ]]; do
     case $1 in
         --proxyclaw-repo)   PROXYCLAW_REPO="$2"; shift 2 ;;
         --proxyclaw-branch) PROXYCLAW_BRANCH="$2"; shift 2 ;;
-        --proxyclaw-path)   PROXYCLAW_LOCAL_PATH="$2"; shift 2 ;;
+        -p|--proxyclaw-path) PROXYCLAW_LOCAL_PATH="$2"; shift 2 ;;
         --no-proxyclaw)     NO_PROXYCLAW=true; shift ;;
+        --no-cache)         NO_CACHE=true; shift ;;
+        --output-dir)       OUTPUT_DIR="$2"; ISO_OUTPUT="${OUTPUT_DIR}/clawbox-${CLAWBOX_VERSION}-amd64.iso"; shift 2 ;;
+        --with-ollama)      WITH_OLLAMA=true; shift ;;
         --help|-h)
             echo "Usage: sudo $0 [选项]"
             echo ""
             echo "proxyclaw 构建选项:"
-            echo "  --proxyclaw-repo URL    GitHub 仓库地址"
-            echo "  --proxyclaw-branch BR   分支名 (默认: main)"
-            echo "  --proxyclaw-path PATH   本地源码路径"
-            echo "  --no-proxyclaw          跳过构建，拉取远程镜像"
+            echo "  -p, --proxyclaw-path PATH   本地源码路径"
+            echo "  --proxyclaw-repo URL        GitHub 仓库地址"
+            echo "  --proxyclaw-branch BR       分支名 (默认: main)"
+            echo "  --no-proxyclaw              跳过构建，拉取远程镜像"
+            echo "  --no-cache                  不使用 rootfs 缓存"
+            echo "  --output-dir DIR            输出目录 (默认: ./output)"
+            echo ""
+            echo "可选组件:"
+            echo "  --with-ollama               包含 Ollama 镜像（约 3GB）"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -64,10 +86,56 @@ if [[ $EUID -ne 0 ]]; then
     err "需要 root 权限运行"
 fi
 
+# ========== 依赖检查 ==========
+info "Checking dependencies..."
+MISSING_DEPS=()
+for cmd in xorriso genisoimage debootstrap; do
+    if ! command -v "$cmd" &>/dev/null; then
+        MISSING_DEPS+=("$cmd")
+    fi
+done
+if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+    info "Installing missing dependencies: ${MISSING_DEPS[*]}"
+    apt-get update -qq
+    apt-get install -y -qq xorriso genisoimage debootstrap 2>&1 | tail -1
+fi
+log "Dependencies OK"
+
 # ========== 清理 ==========
 info "Cleaning build directory..."
 rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR"
+mkdir -p "$WORK_DIR" "$CACHE_DIR"
+
+# 尝试从缓存恢复 rootfs
+ROOTFS_CACHE_HIT=false
+if [ "$NO_CACHE" = false ] && [ -f "$ROOTFS_CACHE" ]; then
+    info "Restoring rootfs from cache: $ROOTFS_CACHE"
+    mkdir -p "$ROOTFS"
+    if tar xzf "$ROOTFS_CACHE" -C "$ROOTFS" 2>&1; then
+        log "Rootfs restored from cache ($(du -sh "$ROOTFS" | cut -f1))"
+        ROOTFS_CACHE_HIT=true
+    else
+        warn "Failed to restore cache, will build from scratch"
+        rm -rf "$ROOTFS"
+        mkdir -p "$ROOTFS"
+    fi
+else
+    if [ "$NO_CACHE" = true ]; then
+        info "Cache disabled (--no-cache)"
+    else
+        info "No rootfs cache found, will build from scratch"
+    fi
+fi
+
+# ClawBox 部署目录与项目目录（即便缓存命中也需引用，故在缓存块之外赋值）
+CLAWBOX_DIR="${ROOTFS}/opt/clawbox"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ ! -f "$PROJECT_DIR/docker-compose.yml" ]]; then
+    PROJECT_DIR="/vol1/@apphome/trim.openclaw/data/workspace/clawbox"
+fi
+
+if [ "$ROOTFS_CACHE_HIT" = false ]; then
 
 # ========== 1. 创建最小 rootfs ==========
 info "Step 1: Creating minimal Debian 12 rootfs..."
@@ -105,13 +173,13 @@ chroot "$ROOTFS" /bin/bash << 'SLIM'
     rm -rf /usr/share/lintian/* /usr/share/linda/*
     find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en' ! -name 'en_US' ! -name 'zh_CN' -exec rm -rf {} + 2>/dev/null || true
     find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 ! -name 'Asia' ! -name 'UTC' -exec rm -rf {} + 2>/dev/null || true
-    
+
     # 禁用不必要的服务
     systemctl disable -f avahi-daemon 2>/dev/null || true
     systemctl disable -f bluetooth 2>/dev/null || true
     systemctl disable -f cups 2>/dev/null || true
     systemctl disable -f getty@tty1 2>/dev/null || true
-    
+
     # 清理日志
     find /var/log -name "*.log" -exec truncate -s 0 {} \;
     find /var/log -name "*.gz" -delete
@@ -146,6 +214,7 @@ LC_ALL=en_US.UTF-8
 EOF
 
 # 网络
+mkdir -p "$ROOTFS/etc/network"
 cat > "$ROOTFS/etc/network/interfaces" << 'EOF'
 auto lo
 iface lo inet loopback
@@ -202,7 +271,7 @@ log "SSH configured"
 info "Step 5: Configuring Docker..."
 
 chroot "$ROOTFS" /bin/bash << 'DOCKER'
-    systemctl enable docker
+    systemctl enable docker 2>/dev/null || true
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json << 'DJSON'
 {
@@ -223,17 +292,7 @@ log "Docker configured"
 # ========== 6. 部署 ClawBox ==========
 info "Step 6: Deploying ClawBox..."
 
-CLAWBOX_DIR="${ROOTFS}/opt/clawbox"
 mkdir -p "$CLAWBOX_DIR"
-
-# 查找项目目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-# 如果项目目录不存在，使用当前工作目录
-if [[ ! -f "$PROJECT_DIR/docker-compose.yml" ]]; then
-    PROJECT_DIR="/vol1/@apphome/trim.openclaw/data/workspace/clawbox"
-fi
 
 if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
     cp "$PROJECT_DIR/docker-compose.yml" "$CLAWBOX_DIR/"
@@ -245,6 +304,24 @@ if [[ -f "$PROJECT_DIR/docker-compose.yml" ]]; then
     cp "$PROJECT_DIR/config/education.yaml" "$CLAWBOX_DIR/config/" 2>/dev/null || true
     echo "$CLAWBOX_VERSION" > "$CLAWBOX_DIR/VERSION"
 fi
+
+# ========== 缓存点：base 系统 + clawbox 文件就绪后保存 ==========
+if [ "$NO_CACHE" = false ]; then
+    info "Saving rootfs to cache: $ROOTFS_CACHE"
+    compressor="gzip"
+    if command -v pigz &>/dev/null; then
+        compressor="pigz"
+    fi
+    if tar cf - -C "$ROOTFS" . | $compressor -9 > "$ROOTFS_CACHE.tmp" 2>&1; then
+        mv "$ROOTFS_CACHE.tmp" "$ROOTFS_CACHE"
+        log "Rootfs cached ($(du -sh "$ROOTFS_CACHE" | cut -f1))"
+    else
+        warn "Failed to save rootfs cache"
+        rm -f "$ROOTFS_CACHE.tmp"
+    fi
+fi
+
+fi  # end of ROOTFS_CACHE_HIT=false block
 
 # ========== 6.5. 构建 proxyclaw 镜像 ==========
 info "Step 6.5: Building proxyclaw Docker image..."
@@ -286,7 +363,6 @@ if [ "$NO_PROXYCLAW" = false ]; then
             warn "No Dockerfile found in proxyclaw source, falling back to remote image pull"
             NO_PROXYCLAW=true
         else
-            local build_context
             build_context=$(dirname "$local_dockerfile")
             info "  Building proxyclaw/proxyclaw:${CLAWBOX_VERSION} from $local_dockerfile"
             if docker build -t "proxyclaw/proxyclaw:${CLAWBOX_VERSION}" -t "proxyclaw/proxyclaw:latest" -f "$local_dockerfile" "$build_context" 2>&1; then
@@ -310,13 +386,15 @@ mkdir -p "$IMAGES_DIR"
 
 # 确定 proxyclaw 镜像
 PROXYCLAW_IMG="proxyclaw/proxyclaw:latest"
-custom_pc=$(grep "^PROXYCLAW_IMAGE=" "${CLAWBOX_DIR}/.env" | cut -d= -f2)
+custom_pc=$(grep "^PROXYCLAW_IMAGE=" "${CLAWBOX_DIR}/.env" 2>/dev/null | cut -d= -f2)
 [ -n "$custom_pc" ] && PROXYCLAW_IMG="$custom_pc"
 
 SAVED_IMAGES=()
 
 # proxyclaw
-if [ "$NO_PROXYCLAW" = false ] && docker image inspect "$PROXYCLAW_IMG" >/dev/null 2>&1; then
+if [ "$NO_PROXYCLAW" = true ]; then
+    info "  Skipping proxyclaw (--no-proxyclaw)"
+elif docker image inspect "$PROXYCLAW_IMG" >/dev/null 2>&1; then
     info "  Using locally built $PROXYCLAW_IMG"
     SAVED_IMAGES+=("$PROXYCLAW_IMG")
 else
@@ -325,16 +403,26 @@ else
 fi
 
 # 其他镜像
-for img in "pgvector/pgvector:pg16" "ollama/ollama:latest" "clawbox/ota-agent:latest"; do
+for img in "pgvector/pgvector:pg16"; do
     info "  Pulling $img ..."
     docker pull "$img" 2>/dev/null && SAVED_IMAGES+=("$img") || warn "  Failed to pull $img"
 done
+
+# OTA agent (如果存在)
+info "  Pulling clawbox/ota-agent:latest ..."
+docker pull "clawbox/ota-agent:latest" 2>/dev/null && SAVED_IMAGES+=("clawbox/ota-agent:latest") || warn "  Failed to pull clawbox/ota-agent:latest, skipping"
+
+# Ollama (可选)
+if [ "$WITH_OLLAMA" = true ]; then
+    info "  Pulling ollama/ollama:latest ..."
+    docker pull "ollama/ollama:latest" 2>/dev/null && SAVED_IMAGES+=("ollama/ollama:latest") || warn "  Failed to pull ollama/ollama:latest"
+fi
 
 if [ ${#SAVED_IMAGES[@]} -gt 0 ]; then
     info "  Saving ${#SAVED_IMAGES[@]} images..."
     docker save "${SAVED_IMAGES[@]}" -o "${IMAGES_DIR}/clawbox-images.tar" 2>/dev/null || {
         for img in "${SAVED_IMAGES[@]}"; do
-            local fname; fname=$(echo "$img" | tr '/:' '_')
+            fname=$(echo "$img" | tr '/:' '_')
             docker save "$img" -o "${IMAGES_DIR}/${fname}.tar" 2>/dev/null || true
         done
     }
@@ -439,9 +527,9 @@ RestartSec=60
 WantedBy=multi-user.target
 EOF
 
-chroot "$ROOTFS" systemctl daemon-reload
-chroot "$ROOTFS" systemctl enable clawbox
-chroot "$ROOTFS" systemctl enable clawbox-ota
+chroot "$ROOTFS" systemctl daemon-reload 2>/dev/null || true
+chroot "$ROOTFS" systemctl enable clawbox 2>/dev/null || true
+chroot "$ROOTFS" systemctl enable clawbox-ota 2>/dev/null || true
 
 log "ClawBox deployed"
 
@@ -468,17 +556,15 @@ set timeout=5
 
 menuentry "ClawBox" {
     insmod gzio
-    insmod part_msdos
-    insmod ext2
-    set root='(hd0,msdos1)'
+    insmod iso9660
+    set root=(cd)
     linux /boot/vmlinuz root=/dev/sda1 ro quiet splash
     initrd /boot/initrd.img
 }
 
 menuentry "ClawBox (Recovery)" {
-    insmod part_msdos
-    insmod ext2
-    set root='(hd0,msdos1)'
+    insmod iso9660
+    set root=(cd)
     linux /boot/vmlinuz root=/dev/sda1 ro single
     initrd /boot/initrd.img
 }
@@ -517,6 +603,35 @@ cp "$ROOTFS/boot/vmlinuz" "$ISO_DIR/boot/vmlinuz" 2>/dev/null || true
 cp "$ROOTFS/boot/initrd.img" "$ISO_DIR/boot/initrd.img" 2>/dev/null || true
 cp "$ROOTFS/boot/grub/grub.cfg" "$ISO_DIR/boot/grub/grub.cfg"
 
+# 生成 GRUB BIOS 启动镜像
+info "Generating GRUB boot images..."
+mkdir -p "${WORK_DIR}/grub"
+
+# 创建嵌入配置：告诉 GRUB 从 ISO 加载 grub.cfg
+cat > "${WORK_DIR}/grub/grub-early.cfg" << 'EARLYCFG'
+set root=(cd)
+set prefix=(cd)/boot/grub
+EARLYCFG
+
+grub-mkimage \
+    -O i386-pc \
+    -o "${WORK_DIR}/grub/bios.img" \
+    -p /boot/grub \
+    -c "${WORK_DIR}/grub/grub-early.cfg" \
+    iso9660 biosdisk 2>/dev/null || warn "Failed to generate bios.img"
+
+# 生成 GRUB EFI 启动镜像
+grub-mkimage \
+    -O x86_64-efi \
+    -o "${WORK_DIR}/EFI.img" \
+    -p /boot/grub \
+    -c "${WORK_DIR}/grub/grub-early.cfg" \
+    fat iso9660 part_gpt part_msdos normal boot linux configfile loopback chain efifwsetup efi_gop efi_uga ls search search_label search_fs_uuid search_fs_file gfxterm gfxterm_background gfxterm_menu test all_video loadenv exfat ext2 ntfs btrfs hfsplus udf 2>/dev/null || warn "Failed to generate EFI.img"
+
+# 复制 GRUB 启动镜像到 ISO 目录
+cp "${WORK_DIR}/grub/bios.img" "$ISO_DIR/boot/grub/bios.img" 2>/dev/null || true
+cp "${WORK_DIR}/EFI.img" "$ISO_DIR/boot/grub/EFI.img" 2>/dev/null || true
+
 # 创建 rootfs 压缩包
 info "Compressing rootfs..."
 cd "$ROOTFS"
@@ -526,6 +641,7 @@ info "Rootfs size: $ROOTFS_SIZE"
 
 # 使用 xorriso 创建 ISO
 info "Creating ISO with xorriso..."
+mkdir -p "$OUTPUT_DIR"
 
 xorriso -as mkisofs \
     -iso-level 3 \

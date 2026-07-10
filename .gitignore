@@ -1,5 +1,8 @@
 # 构建产物
 output/
+build/
+build-cache/
+.qemu/
 *.img
 *.img.gz
 *.tar.gz

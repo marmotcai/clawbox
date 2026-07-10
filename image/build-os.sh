@@ -7,20 +7,26 @@
 #   --output-dir       输出目录 (默认: ./output)
 #   --image-size       镜像大小 (默认: 4G)
 #   --hostname         主机名 (默认: clawbox)
+#   -p|--proxyclaw-path PATH   proxyclaw 本地源码路径 (优先级高于 --proxyclaw-repo)
 #   --proxyclaw-repo   proxyclaw GitHub 仓库地址 (默认: https://github.com/proxyclaw/proxyclaw.git)
 #   --proxyclaw-branch proxyclaw 分支名 (默认: main)
-#   --proxyclaw-path   proxyclaw 本地源码路径 (优先级高于 --proxyclaw-repo)
 #   --no-proxyclaw     不构建 proxyclaw，直接拉取远程镜像
+#   --no-cache         不使用 rootfs 缓存，强制全量重建
+#   --with-ollama      包含 Ollama 镜像（默认不包含）
 # ============================================================
 
 set -euo pipefail
 
+# ========== 路径（基于脚本位置，避免 sudo 时 cwd 不一致） ==========
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
 # ========== 默认参数 ==========
-OUTPUT_DIR="./output"
+OUTPUT_DIR="${PROJECT_DIR}/output"
 IMAGE_SIZE="4G"
 HOSTNAME="clawbox"
 CLAWBOX_VERSION="${CLAWBOX_VERSION:-1.0.0}"
-WORK_DIR="./build"
+WORK_DIR="${PROJECT_DIR}/build"
 ROOTFS="${WORK_DIR}/rootfs"
 MOUNT_POINT="${WORK_DIR}/mnt"
 
@@ -30,6 +36,14 @@ PROXYCLAW_BRANCH="main"
 PROXYCLAW_LOCAL_PATH=""
 NO_PROXYCLAW=false
 PROXYCLAW_BUILD_DIR=""  # 实际使用的构建目录
+
+# 可选组件
+WITH_OLLAMA=false
+
+# rootfs 缓存
+NO_CACHE=false
+CACHE_DIR="${PROJECT_DIR}/build-cache"
+ROOTFS_CACHE=""  # 在 main 中赋值
 
 # 镜像名称
 TIMESTAMP=$(date +%Y%m%d)
@@ -53,13 +67,21 @@ err()   { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --output-dir)       OUTPUT_DIR="$2"; shift 2 ;;
+            --output-dir)
+                OUTPUT_DIR="$2"
+                if [[ "$OUTPUT_DIR" != /* ]]; then
+                    OUTPUT_DIR="${PROJECT_DIR}/${OUTPUT_DIR#./}"
+                fi
+                shift 2
+                ;;
             --image-size)       IMAGE_SIZE="$2"; shift 2 ;;
             --hostname)         HOSTNAME="$2"; shift 2 ;;
+            -p|--proxyclaw-path) PROXYCLAW_LOCAL_PATH="$2"; shift 2 ;;
             --proxyclaw-repo)   PROXYCLAW_REPO="$2"; shift 2 ;;
             --proxyclaw-branch) PROXYCLAW_BRANCH="$2"; shift 2 ;;
-            --proxyclaw-path)   PROXYCLAW_LOCAL_PATH="$2"; shift 2 ;;
             --no-proxyclaw)     NO_PROXYCLAW=true; shift ;;
+            --no-cache)         NO_CACHE=true; shift ;;
+            --with-ollama)      WITH_OLLAMA=true; shift ;;
             --help|-h)
                 echo "Usage: sudo $0 [选项]"
                 echo ""
@@ -67,24 +89,31 @@ parse_args() {
                 echo "  --output-dir DIR        输出目录 (默认: ./output)"
                 echo "  --image-size SIZE       镜像大小 (默认: 4G)"
                 echo "  --hostname NAME         主机名 (默认: clawbox)"
+                echo "  --no-cache              不使用 rootfs 缓存，强制全量重建"
                 echo ""
                 echo "proxyclaw 构建选项:"
-                echo "  --proxyclaw-repo URL    proxyclaw GitHub 仓库地址"
-                echo "                          (默认: https://github.com/proxyclaw/proxyclaw.git)"
-                echo "  --proxyclaw-branch BR   proxyclaw 分支名 (默认: main)"
-                echo "  --proxyclaw-path PATH   proxyclaw 本地源码路径 (优先级最高)"
-                echo "  --no-proxyclaw          跳过构建，直接拉取远程镜像"
+                echo "  -p, --proxyclaw-path PATH   proxyclaw 本地源码路径 (优先级最高)"
+                echo "  --proxyclaw-repo URL        proxyclaw GitHub 仓库地址"
+                echo "                              (默认: https://github.com/proxyclaw/proxyclaw.git)"
+                echo "  --proxyclaw-branch BR       proxyclaw 分支名 (默认: main)"
+                echo "  --no-proxyclaw              跳过构建，直接拉取远程镜像"
+                echo ""
+                echo "可选组件:"
+                echo "  --with-ollama               包含 Ollama 镜像（约 3GB）"
                 echo ""
                 echo "示例:"
+                echo "  sudo $0 -p /path/to/proxyclaw"
                 echo "  sudo $0 --proxyclaw-path /path/to/proxyclaw"
                 echo "  sudo $0 --proxyclaw-branch develop"
                 echo "  sudo $0 --no-proxyclaw"
+                echo "  sudo $0 --no-proxyclaw --with-ollama"
                 exit 0
                 ;;
             *) err "Unknown option: $1" ;;
         esac
     done
     IMAGE_FILE="${OUTPUT_DIR}/${IMAGE_NAME}.img"
+    ROOTFS_CACHE="${CACHE_DIR}/rootfs-${HOSTNAME}.tar.gz"
 }
 
 # ========== 权限检查 ==========
@@ -114,25 +143,92 @@ check_deps() {
 }
 
 # ========== 清理构建目录 ==========
-clean_build() {
-    info "Cleaning previous build..."
-    
-    # 卸载残留挂载
-    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        umount -lf "$MOUNT_POINT" 2>/dev/null || true
-    fi
-    
-    # 清理循环设备
+safe_umount() {
+    local mp="$1"
+    mountpoint -q "$mp" 2>/dev/null || return 0
+    umount "$mp" 2>/dev/null || umount -lf "$mp" 2>/dev/null || true
+}
+
+unmount_chroot_binds() {
+    local target="$1"
+    [[ -d "$target" ]] || return 0
+    safe_umount "${target}/dev/pts"
+    safe_umount "${target}/sys"
+    safe_umount "${target}/proc"
+    safe_umount "${target}/dev"
+}
+
+cleanup_stale_mounts() {
+    unmount_chroot_binds "$MOUNT_POINT"
+    unmount_chroot_binds "$ROOTFS"
+    safe_umount "$MOUNT_POINT"
+
     if [[ -f "${WORK_DIR}/loop_device" ]]; then
         local loop_dev
         loop_dev=$(cat "${WORK_DIR}/loop_device")
         losetup -d "$loop_dev" 2>/dev/null || true
         rm -f "${WORK_DIR}/loop_device"
     fi
-    
+}
+
+clean_build() {
+    info "Cleaning previous build..."
+
+    cleanup_stale_mounts
+
     rm -rf "$WORK_DIR"
-    mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
-    log "Build directory cleaned"
+    mkdir -p "$WORK_DIR" "$OUTPUT_DIR" "$CACHE_DIR"
+    log "Build directory cleaned (cache preserved at $CACHE_DIR)"
+}
+
+# ========== 从缓存恢复 rootfs ==========
+# 返回 0 表示命中缓存，1 表示未命中
+restore_rootfs_cache() {
+    if [ "$NO_CACHE" = true ]; then
+        info "Cache disabled (--no-cache)"
+        return 1
+    fi
+
+    if [ ! -f "$ROOTFS_CACHE" ]; then
+        info "No rootfs cache found, will build from scratch"
+        return 1
+    fi
+
+    info "Restoring rootfs from cache: $ROOTFS_CACHE"
+    mkdir -p "$ROOTFS"
+    if tar xzf "$ROOTFS_CACHE" -C "$ROOTFS" 2>&1; then
+        log "Rootfs restored from cache ($(du -sh "$ROOTFS" | cut -f1))"
+        return 0
+    else
+        warn "Failed to restore cache, will build from scratch"
+        rm -rf "$ROOTFS"
+        mkdir -p "$ROOTFS"
+        return 1
+    fi
+}
+
+# ========== 保存 rootfs 到缓存 ==========
+# 缓存点：deploy_clawbox 之后，build_proxyclaw 之前
+# 这样缓存包含完整的 base 系统 + clawbox 文件，但不包含可能变化的 proxyclaw 镜像
+save_rootfs_cache() {
+    if [ "$NO_CACHE" = true ]; then
+        return 0
+    fi
+
+    info "Saving rootfs to cache: $ROOTFS_CACHE"
+    mkdir -p "$CACHE_DIR"
+    # 使用 pigz 如果可用，否则 gzip
+    local compressor="gzip"
+    if command -v pigz &>/dev/null; then
+        compressor="pigz"
+    fi
+    if tar cf - -C "$ROOTFS" . | $compressor -9 > "$ROOTFS_CACHE.tmp" 2>&1; then
+        mv "$ROOTFS_CACHE.tmp" "$ROOTFS_CACHE"
+        log "Rootfs cached ($(du -sh "$ROOTFS_CACHE" | cut -f1))"
+    else
+        warn "Failed to save rootfs cache"
+        rm -f "$ROOTFS_CACHE.tmp"
+    fi
 }
 
 # ========== 1. 创建最小 rootfs ==========
@@ -154,9 +250,11 @@ iproute2,iputils-ping,inetutils-telnet,\
 sudo,passwd,login,\
 locales,\
 docker.io,docker-compose,\
+linux-image-amd64,initramfs-tools,\
+e2fsprogs,kmod,\
 lsof,htop,tmux,nano" \
         --exclude="\
-e2fsprogs,busybox,kmod,\
+busybox,\
 plymouth,systemd-resolved,\
 neovim,vim-common,vim-tiny" \
         bookworm \
@@ -183,8 +281,11 @@ slim_system() {
         rm -rf /usr/share/lintian/*
         rm -rf /usr/share/linda/*
         
-        # 清理 locale (保留 en_US 和 zh_CN)
-        find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en' ! -name 'en_US' ! -name 'zh_CN' -exec rm -rf {} + 2>/dev/null || true
+        # 清理 locale (保留 en_US 和 zh_CN，以及 locale.alias 文件)
+        find /usr/share/locale -mindepth 1 -maxdepth 1 \
+            ! -name 'en' ! -name 'en_US' ! -name 'zh_CN' \
+            ! -name 'locale.alias' \
+            -exec rm -rf {} + 2>/dev/null || true
         
         # 清理时区数据 (只保留亚洲)
         find /usr/share/zoneinfo -mindepth 1 -maxdepth 1 ! -name 'Asia' ! -name 'UTC' -exec rm -rf {} + 2>/dev/null || true
@@ -234,6 +335,15 @@ LC_ALL=en_US.UTF-8
 EOF
     
     # ---- 网络 ----
+    # minbase 变体不含 ifupdown，需先安装；同时确保目录存在
+    mkdir -p "$ROOTFS/etc/network"
+    if ! chroot "$ROOTFS" dpkg -s ifupdown &>/dev/null; then
+        chroot "$ROOTFS" apt-get update -qq
+        chroot "$ROOTFS" apt-get install -y --no-install-recommends ifupdown
+        chroot "$ROOTFS" apt-get clean
+        rm -rf "$ROOTFS/var/lib/apt/lists/*"
+    fi
+    mkdir -p "$ROOTFS/etc/network"
     cat > "$ROOTFS/etc/network/interfaces" << EOF
 auto lo
 iface lo inet loopback
@@ -360,9 +470,6 @@ deploy_clawbox() {
     mkdir -p "$clawbox_dir"
     
     # 复制项目文件
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-    
     cp "$PROJECT_DIR/docker-compose.yml" "$clawbox_dir/"
     cp "$PROJECT_DIR/.env.example" "$clawbox_dir/.env"
     cp "$PROJECT_DIR/ota/ota-agent.sh" "$clawbox_dir/"
@@ -371,7 +478,7 @@ deploy_clawbox() {
     
     # 复制教育配置
     mkdir -p "$clawbox_dir/config"
-    cp "$PROJECT_DIR/config/education.yaml" "$clawbox_dir/config/"
+    cp "$PROJECT_DIR/config/education.yaml" "$clawbox_dir/config/" 2>/dev/null || true
     
     # 版本信息
     echo "$CLAWBOX_VERSION" > "$clawbox_dir/VERSION"
@@ -435,13 +542,14 @@ build_proxyclaw() {
 
     info "  Dockerfile: $dockerfile"
 
-    # 构建镜像
-    local build_context
-    build_context=$(dirname "$dockerfile")
+    # 构建镜像 — 使用项目根目录作为 build context（Dockerfile 可能在子目录）
+    local build_context="$PROXYCLAW_BUILD_DIR"
     local proxyclaw_image="proxyclaw/proxyclaw:${CLAWBOX_VERSION}"
 
+    # 将 Dockerfile 路径转为相对于 build context 的路径
+    local dockerfile_rel="${dockerfile#${build_context}/}"
     info "  Building $proxyclaw_image ..."
-    if docker build -t "$proxyclaw_image" -t "proxyclaw/proxyclaw:latest" -f "$dockerfile" "$build_context" 2>&1; then
+    if docker build -t "$proxyclaw_image" -t "proxyclaw/proxyclaw:latest" -f "$dockerfile_rel" "$build_context" 2>&1; then
         log "proxyclaw image built: $proxyclaw_image"
 
         # 更新 .env 使用本地构建的镜像
@@ -463,11 +571,10 @@ prefetch_images() {
     local proxyclaw_img="proxyclaw/proxyclaw:latest"
     local ota_img="clawbox/ota-agent:latest"
     if [ -f "${ROOTFS}/opt/clawbox/.env" ]; then
-        local custom_pc
-        custom_pc=$(grep "^PROXYCLAW_IMAGE=" "${ROOTFS}/opt/clawbox/.env" | cut -d= -f2)
+        local custom_pc custom_ota
+        custom_pc=$(grep "^PROXYCLAW_IMAGE=" "${ROOTFS}/opt/clawbox/.env" 2>/dev/null | cut -d= -f2 || true)
         [ -n "$custom_pc" ] && proxyclaw_img="$custom_pc"
-        local custom_ota
-        custom_ota=$(grep "^OTA_IMAGE=" "${ROOTFS}/opt/clawbox/.env" | cut -d= -f2)
+        custom_ota=$(grep "^OTA_IMAGE=" "${ROOTFS}/opt/clawbox/.env" 2>/dev/null | cut -d= -f2 || true)
         [ -n "$custom_ota" ] && ota_img="$custom_ota"
     fi
 
@@ -475,7 +582,9 @@ prefetch_images() {
     local failed_images=()
 
     # proxyclaw: 如果本地已构建，跳过 pull 直接用 save
-    if [ "$NO_PROXYCLAW" = false ] && docker image inspect "$proxyclaw_img" >/dev/null 2>&1; then
+    if [ "$NO_PROXYCLAW" = true ]; then
+        info "  Skipping proxyclaw (--no-proxyclaw)"
+    elif docker image inspect "$proxyclaw_img" >/dev/null 2>&1; then
         info "  Using locally built $proxyclaw_img"
         images+=("$proxyclaw_img")
     else
@@ -491,7 +600,6 @@ prefetch_images() {
     # 其他镜像
     local other_images=(
         "pgvector/pgvector:pg16"
-        "ollama/ollama:latest"
     )
     for img in "${other_images[@]}"; do
         info "  Pulling $img ..."
@@ -510,6 +618,17 @@ prefetch_images() {
     else
         warn "  Failed to pull $ota_img, skipping..."
         failed_images+=("$ota_img")
+    fi
+
+    # Ollama (可选)
+    if [ "$WITH_OLLAMA" = true ]; then
+        info "  Pulling ollama/ollama:latest ..."
+        if docker pull "ollama/ollama:latest" 2>/dev/null; then
+            images+=("ollama/ollama:latest")
+        else
+            warn "  Failed to pull ollama/ollama:latest, skipping..."
+            failed_images+=("ollama/ollama:latest")
+        fi
     fi
 
     if [ ${#images[@]} -eq 0 ]; then
@@ -734,9 +853,13 @@ while [ $retries -gt 0 ]; do
     sleep 2
 done
 
-# 6. 下载 Embedding 模型
-log "Downloading embedding model..."
-docker exec clawbox-ollama ollama pull bge-m3 2>&1 | tee -a "$LOG"
+# 6. 下载 Embedding 模型（仅当 Ollama 运行时）
+if docker ps --format '{{.Names}}' | grep -q ollama; then
+    log "Downloading embedding model..."
+    docker exec clawbox-ollama ollama pull bge-m3 2>&1 | tee -a "$LOG" || log "Failed to download embedding model"
+else
+    log "Ollama not running, skipping embedding model download"
+fi
 
 # 7. 标记完成
 touch "$SETUP_DONE"
@@ -747,6 +870,57 @@ FIRSTBOOT
     chmod +x "$ROOTFS/opt/clawbox/first-boot.sh"
     
     log "First-boot script created"
+}
+
+# ========== chroot 辅助（apt / grub 安装需要） ==========
+chroot_prepare() {
+    local target="$1"
+    cp /etc/resolv.conf "${target}/etc/resolv.conf" 2>/dev/null || true
+    mount --bind /dev "${target}/dev"
+    mount --bind /proc "${target}/proc"
+    mount --bind /sys "${target}/sys"
+    mount --bind /dev/pts "${target}/dev/pts" 2>/dev/null || true
+}
+
+chroot_cleanup() {
+    local target="$1"
+    unmount_chroot_binds "$target"
+}
+
+# ========== 9.5 确保内核（兼容旧 rootfs 缓存） ==========
+ensure_bootloader() {
+    info "Ensuring kernel..."
+
+    if compgen -G "${ROOTFS}/boot/vmlinuz-"* >/dev/null; then
+        log "Kernel already present"
+        return 0
+    fi
+
+    warn "旧缓存缺少内核，正在下载 linux-image-amd64（约 300MB，需 3-10 分钟，请耐心等待）..."
+    chroot_prepare "$ROOTFS"
+    trap 'chroot_cleanup "$ROOTFS"' INT TERM
+
+    if ! chroot "$ROOTFS" /bin/bash << 'BOOTPKG'; then
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+            linux-image-amd64 \
+            initramfs-tools \
+            e2fsprogs kmod
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+BOOTPKG
+        chroot_cleanup "$ROOTFS"
+        trap - INT TERM
+        err "内核安装失败"
+    fi
+
+    chroot_cleanup "$ROOTFS"
+    trap - INT TERM
+
+    compgen -G "${ROOTFS}/boot/vmlinuz-"* >/dev/null || err "Failed to install kernel in rootfs"
+    log "Kernel installed"
 }
 
 # ========== 10. 打包磁盘镜像 ==========
@@ -775,14 +949,8 @@ build_disk_image() {
     
     # 复制 rootfs
     cp -a "$ROOTFS"/. "$MOUNT_POINT"/
-    
-    # 安装 GRUB
-    chroot "$MOUNT_POINT" /bin/bash << GRUB
-        grub-install --target=i386-pc "$loop_dev" 2>/dev/null || true
-        update-grub 2>/dev/null || true
-GRUB
-    
-    # 配置 fstab
+
+    # 先写 fstab，update-grub 需要正确的根分区 UUID
     local root_uuid
     root_uuid=$(blkid -s UUID -o value "${loop_dev}p1")
     cat > "$MOUNT_POINT/etc/fstab" << EOF
@@ -790,6 +958,30 @@ UUID=$root_uuid  /  ext4  errors=remount-ro  0  1
 tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,noexec,size=256M 0 0
 tmpfs /var/log tmpfs defaults,noatime,nosuid,nodev,size=128M 0 0
 EOF
+
+    # 安装 GRUB 到 MBR（grub-pc 在此步安装，避免 chroot 交互式提示卡死）
+    info "Installing GRUB to disk..."
+    chroot_prepare "$MOUNT_POINT"
+
+    chroot "$MOUNT_POINT" /bin/bash << GRUB
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        if ! dpkg -s grub-pc >/dev/null 2>&1; then
+            debconf-set-selections << 'DEBCONF'
+grub-pc grub-pc/install_devices multiselect
+grub-pc grub-pc/install_devices_empty boolean true
+grub-pc grub-pc/install_devices_disks_changed boolean false
+DEBCONF
+            apt-get update
+            apt-get install -y --no-install-recommends grub-pc grub-common
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+        fi
+        grub-install --target=i386-pc --bootloader-id=ClawBox --recheck "${loop_dev}"
+        update-grub
+GRUB
+
+    chroot_cleanup "$MOUNT_POINT"
     
     # 卸载
     sync
@@ -852,24 +1044,39 @@ main() {
     parse_args "$@"
     check_root
     check_deps
-    
+    trap cleanup_stale_mounts EXIT INT TERM
+
     echo ""
     echo -e "${CYAN}ClawBox OS Builder v${CLAWBOX_VERSION}${NC}"
     echo "========================================"
     echo ""
-    
+
     clean_build
-    create_rootfs
-    slim_system
-    configure_system
-    configure_ssh
-    install_docker
-    deploy_clawbox
+
+    # 尝试从缓存恢复 rootfs
+    local cache_hit=false
+    if restore_rootfs_cache; then
+        cache_hit=true
+        log "Using cached rootfs, skipping debootstrap + slim + configure + ssh + docker + deploy"
+    fi
+
+    if [ "$cache_hit" = false ]; then
+        create_rootfs
+        slim_system
+        configure_system
+        configure_ssh
+        install_docker
+        deploy_clawbox
+        # 缓存点：base 系统 + clawbox 文件就绪后保存
+        save_rootfs_cache
+    fi
+
     build_proxyclaw
     prefetch_images
     create_services
     create_user
     setup_first_boot
+    ensure_bootloader
     build_disk_image
     show_result
 }

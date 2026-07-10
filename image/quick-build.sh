@@ -3,10 +3,11 @@
 # ClawBox 快速构建 — 一键构建系统镜像
 #
 # 用法: sudo ./quick-build.sh [选项]
+#   -p|--proxyclaw-path PATH   本地源码路径
 #   --proxyclaw-repo   URL     GitHub 仓库地址
 #   --proxyclaw-branch BR     分支名 (默认: main)
-#   --proxyclaw-path   PATH   本地源码路径
 #   --no-proxyclaw            跳过构建，拉取远程镜像
+#   --no-cache                不使用 rootfs 缓存，强制全量重建
 # ============================================================
 
 set -euo pipefail
@@ -24,7 +25,7 @@ BUILD_OS_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --proxyclaw-*|--no-proxyclaw)
+        --proxyclaw-*|--no-proxyclaw|--no-cache)
             BUILD_OS_ARGS+=("$1")
             if [[ "$1" == *"="* ]]; then
                 shift
@@ -38,14 +39,17 @@ while [[ $# -gt 0 ]]; do
                 esac
             fi
             ;;
+        -p)
+            BUILD_OS_ARGS+=("--proxyclaw-path" "$2"); shift 2 ;;
         --help|-h)
             echo "Usage: sudo $0 [选项]"
             echo ""
             echo "proxyclaw 构建选项:"
-            echo "  --proxyclaw-repo URL     GitHub 仓库地址"
-            echo "  --proxyclaw-branch BR    分支名 (默认: main)"
-            echo "  --proxyclaw-path PATH    本地源码路径"
-            echo "  --no-proxyclaw           跳过构建，拉取远程镜像"
+            echo "  -p, --proxyclaw-path PATH   本地源码路径"
+            echo "  --proxyclaw-repo URL        GitHub 仓库地址"
+            echo "  --proxyclaw-branch BR       分支名 (默认: main)"
+            echo "  --no-proxyclaw              跳过构建，拉取远程镜像"
+            echo "  --no-cache                  不使用 rootfs 缓存"
             exit 0
             ;;
         *)

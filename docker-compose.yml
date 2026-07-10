@@ -22,14 +22,15 @@ services:
       - PG_PASSWORD=${PG_PASSWORD}
       - PG_DATABASE=proxyclaw
       - PG_SSL_MODE=disable
+      - PG_SSLMODE=disable
       # 管理员
       - LLM_PROXY_ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - LLM_PROXY_ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      # Ollama (embedding)
-      - OLLAMA_ENABLED=true
+      # Ollama (embedding) — 可选，通过 OLLAMA_ENABLED 控制
+      - OLLAMA_ENABLED=${OLLAMA_ENABLED:-false}
       - OLLAMA_HOST=http://clawbox-ollama:11434
       - OLLAMA_BASE_URL=http://clawbox-ollama:11434
-      - EMBEDDING_BACKEND=ollama-local
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-none}
       - EMBEDDING_MODEL=bge-m3
       # 日志
       - LOG_LEVEL=${LOG_LEVEL:-info}
@@ -44,8 +45,6 @@ services:
     depends_on:
       postgresql:
         condition: service_healthy
-      ollama:
-        condition: service_started
     networks:
       - clawbox-net
     healthcheck:
@@ -75,11 +74,16 @@ services:
       retries: 5
       start_period: 10s
 
-  # ========== Ollama (Embedding) ==========
+  # ========== Ollama (Embedding，可选) ==========
+  # 默认不启动，需要本地 embedding 时启用：
+  #   docker compose --profile embedding up -d
+  # 或在 .env 中设置 OLLAMA_ENABLED=true 并使用 --profile embedding
   ollama:
     image: ollama/ollama:latest
     container_name: clawbox-ollama
     restart: unless-stopped
+    profiles:
+      - embedding
     volumes:
       - ollama_data:/root/.ollama
     networks:
