@@ -89,7 +89,7 @@ fi
 # ========== 依赖检查 ==========
 info "Checking dependencies..."
 MISSING_DEPS=()
-for cmd in xorriso genisoimage debootstrap mksquashfs; do
+for cmd in xorriso genisoimage debootstrap mksquashfs isolinux; do
     if ! command -v "$cmd" &>/dev/null; then
         MISSING_DEPS+=("$cmd")
     fi
@@ -147,7 +147,7 @@ chroot "$ROOTFS" /bin/bash << 'SLIM'
     systemctl disable -f avahi-daemon 2>/dev/null || true
     systemctl disable -f bluetooth 2>/dev/null || true
     systemctl disable -f cups 2>/dev/null || true
-    systemctl disable -f getty@tty1 2>/dev/null || true
+    # 不禁用 getty，保持登录终端可用
 
     find /var/log -name "*.log" -exec truncate -s 0 {} \;
     find /var/log -name "*.gz" -delete
@@ -241,7 +241,7 @@ chroot "$ROOTFS" /bin/bash << 'DOCKER'
         "max-size": "10m",
         "max-file": "3"
     },
-    "storage-driver": "overlay2",
+    "storage-driver": "vfs",
     "data-root": "/var/lib/docker"
 }
 DJSON
@@ -430,11 +430,20 @@ log "initramfs rebuilt with casper support"
 # ========== 11. 构建 ISO ==========
 info "Step 11: Building ISO..."
 
+# 安装 isolinux/syslinux
+info "Installing isolinux/syslinux..."
+chroot "$ROOTFS" /bin/bash << 'ISOLINUX_INST'
+    apt-get update -qq
+    apt-get install -y -qq isolinux syslinux syslinux-common 2>&1 | tail -1
+ISOLINUX_INST
+log "isolinux/syslinux installed"
+
 # 创建 ISO 目录结构
 ISO_DIR="${WORK_DIR}/iso"
 rm -rf "$ISO_DIR"
-mkdir -p "$ISO_DIR/boot/grub"
+mkdir -p "$ISO_DIR/isolinux"
 mkdir -p "$ISO_DIR/casper"
+mkdir -p "$ISO_DIR/boot"
 
 # 1. 创建 squashfs rootfs
 info "Creating squashfs (this may take a while)..."
@@ -458,74 +467,48 @@ echo "$ESTIMATED_SIZE" > "$ISO_DIR/casper/filesystem.size"
 touch "$ISO_DIR/casper/filesystem.manifest"
 touch "$ISO_DIR/casper/filesystem.manifest-desktop"
 
-# 5. 创建 md5sum.txt
+# 5. 复制 isolinux 文件
+info "Setting up isolinux boot..."
+cp /usr/lib/ISOLINUX/isolinux.bin "$ISO_DIR/isolinux/" 2>/dev/null || err "isolinux.bin not found"
+cp /usr/lib/syslinux/modules/bios/*.c32 "$ISO_DIR/isolinux/" 2>/dev/null || true
+
+# 6. 创建 isolinux 配置
+cat > "$ISO_DIR/isolinux/isolinux.cfg" << 'ISOLINUXEOF'
+UI vesamenu.c32
+PROMPT 0
+TIMEOUT 50
+DEFAULT clawbox
+
+MENU TITLE ClawBox Live Boot
+
+LABEL clawbox
+    MENU LABEL ClawBox Live
+    KERNEL /casper/vmlinuz
+    APPEND boot=live live-media=removable live-media-path=casper initrd=/casper/initrd
+
+LABEL clawbox-nomodeset
+    MENU LABEL ClawBox Live (nomodeset)
+    KERNEL /casper/vmlinuz
+    APPEND boot=live nomodeset live-media=removable live-media-path=casper initrd=/casper/initrd
+
+LABEL clawbox-recovery
+    MENU LABEL ClawBox (Recovery)
+    KERNEL /casper/vmlinuz
+    APPEND boot=live recovery live-media=removable live-media-path=casper initrd=/casper/initrd
+
+LABEL clawbox-debug
+    MENU LABEL ClawBox (Debug)
+    KERNEL /casper/vmlinuz
+    APPEND boot=live nomodeset live-media=removable live-media-path=casper debug initrd=/casper/initrd
+ISOLINUXEOF
+
+# 7. 创建 md5sum.txt
 info "Calculating checksums..."
 cd "$ISO_DIR"
-find . -type f ! -name md5sum.txt ! -name boot/grub/bios.img ! -name boot/grub/EFI.img ! -name EFI.img -exec md5sum {} \; > md5sum.txt
+find . -type f ! -name md5sum.txt -exec md5sum {} \; > md5sum.txt
 cd "$SCRIPT_DIR"
 
-# 6. 复制内核到 boot 目录
-cp "${ROOTFS}/boot/vmlinuz" "$ISO_DIR/boot/vmlinuz" 2>/dev/null || true
-cp "${ROOTFS}/boot/initrd.img" "$ISO_DIR/boot/initrd.img" 2>/dev/null || true
-
-# 7. 创建 GRUB 配置 (使用 boot=live + live-media-path=casper)
-info "Creating GRUB config..."
-cat > "$ISO_DIR/boot/grub/grub.cfg" << 'GRUBEOF'
-set default=0
-set timeout=5
-
-menuentry "ClawBox Live" {
-    set gfxpayload=keep
-    linux /casper/vmlinuz boot=live live-media=removable live-media-path=casper ---
-    initrd /casper/initrd
-}
-
-menuentry "ClawBox Live (Try without installing)" {
-    set gfxpayload=keep
-    linux /casper/vmlinuz boot=live nomodeset live-media=removable live-media-path=casper ---
-    initrd /casper/initrd
-}
-
-menuentry "ClawBox (Recovery)" {
-    set gfxpayload=keep
-    linux /casper/vmlinuz boot=live recovery live-media=removable live-media-path=casper ---
-    initrd /casper/initrd
-}
-
-menuentry "ClawBox (Debug - verbose boot)" {
-    set gfxpayload=keep
-    linux /casper/vmlinuz boot=live nomodeset live-media=removable live-media-path=casper debug ---
-    initrd /casper/initrd
-}
-GRUBEOF
-
-# 8. 生成 GRUB BIOS 启动镜像
-info "Generating GRUB boot images..."
-mkdir -p "${WORK_DIR}/grub"
-
-cat > "${WORK_DIR}/grub/grub-early.cfg" << 'EARLYCFG'
-set root=(cd)
-set prefix=(cd)/boot/grub
-EARLYCFG
-
-grub-mkimage \
-    -O i386-pc \
-    -o "${WORK_DIR}/grub/bios.img" \
-    -p /boot/grub \
-    -c "${WORK_DIR}/grub/grub-early.cfg" \
-    iso9660 biosdisk 2>/dev/null || warn "Failed to generate bios.img"
-
-grub-mkimage \
-    -O x86_64-efi \
-    -o "${WORK_DIR}/EFI.img" \
-    -p /boot/grub \
-    -c "${WORK_DIR}/grub/grub-early.cfg" \
-    fat iso9660 part_gpt part_msdos normal boot linux configfile loopback chain efifwsetup efi_gop efi_uga ls search search_label search_fs_uuid search_fs_file gfxterm gfxterm_background gfxterm_menu test all_video loadenv exfat ext2 ntfs btrfs hfsplus udf 2>/dev/null || warn "Failed to generate EFI.img"
-
-cp "${WORK_DIR}/grub/bios.img" "$ISO_DIR/boot/grub/bios.img" 2>/dev/null || true
-cp "${WORK_DIR}/EFI.img" "$ISO_DIR/boot/grub/EFI.img" 2>/dev/null || true
-
-# 9. 使用 xorriso 创建 ISO
+# 8. 使用 xorriso 创建 ISO (isolinux 引导)
 info "Creating ISO with xorriso..."
 mkdir -p "$OUTPUT_DIR"
 
@@ -534,23 +517,21 @@ xorriso -as mkisofs \
     -full-iso9660-filenames \
     -volid "$ISO_VOLUME" \
     -output "$ISO_OUTPUT" \
-    -eltorito-boot boot/grub/bios.img \
+    -b isolinux/isolinux.bin \
+    -c isolinux/boot.cat \
+    -no-emul-boot \
+    -boot-load-size 4 \
+    -boot-info-table \
+    -eltorito-boot isolinux/isolinux.bin \
         -no-emul-boot \
         -boot-load-size 4 \
         -boot-info-table \
-        --grub2-boot-info \
-    -eltorito-catalog boot/grub/boot.cat \
-    -append_partition 2 0xef ${WORK_DIR}/EFI.img \
-    -eltorito-alt-boot \
-        -e --interval:appended_partition_2:all:: \
-        -no-emul-boot \
-        -isohybrid-gpt-basdat \
     "$ISO_DIR" 2>&1 || {
         warn "xorriso failed, trying simple ISO creation..."
         genisoimage -r -J -T \
             -V "$ISO_VOLUME" \
-            -b boot/grub/bios.img \
-            -c boot/grub/boot.cat \
+            -b isolinux/isolinux.bin \
+            -c isolinux/boot.cat \
             -no-emul-boot \
             -boot-load-size 4 \
             -boot-info-table \
