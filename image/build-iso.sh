@@ -476,19 +476,25 @@ set timeout=5
 
 menuentry "ClawBox Live" {
     set gfxpayload=keep
-    linux /casper/vmlinuz boot=live quiet splash live-media=removable live-media-path=casper ---
+    linux /casper/vmlinuz boot=live live-media=removable live-media-path=casper ---
     initrd /casper/initrd
 }
 
 menuentry "ClawBox Live (Try without installing)" {
     set gfxpayload=keep
-    linux /casper/vmlinuz boot=live quiet splash nomodeset live-media=removable live-media-path=casper ---
+    linux /casper/vmlinuz boot=live nomodeset live-media=removable live-media-path=casper ---
     initrd /casper/initrd
 }
 
 menuentry "ClawBox (Recovery)" {
     set gfxpayload=keep
-    linux /casper/vmlinuz boot=live recovery quiet splash live-media=removable live-media-path=casper ---
+    linux /casper/vmlinuz boot=live recovery live-media=removable live-media-path=casper ---
+    initrd /casper/initrd
+}
+
+menuentry "ClawBox (Debug - verbose boot)" {
+    set gfxpayload=keep
+    linux /casper/vmlinuz boot=live nomodeset live-media=removable live-media-path=casper debug ---
     initrd /casper/initrd
 }
 GRUBEOF
