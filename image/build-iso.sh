@@ -399,33 +399,14 @@ fi
 
 log "Kernel copied: ${KERNEL_VERSION:-unknown}"
 
-# ========== 10. 重建 initramfs 并添加 casper 符号链接 ==========
-info "Step 10: Rebuilding initramfs with casper support..."
+# ========== 10. 重建 initramfs ==========
+info "Step 10: Rebuilding initramfs..."
 
-# 重建 initramfs
 chroot "$ROOTFS" update-initramfs -u -k all 2>&1 | tail -3
-
-# 提取 initramfs 并创建 casper 符号链接
-INITRD_DIR="${WORK_DIR}/initrd-extract"
-mkdir -p "$INITRD_DIR"
-cd "$INITRD_DIR"
-rm -rf *
-
-zcat "${ROOTFS}/boot/initrd.img-${KERNEL_VERSION}" | cpio -id 2>/dev/null
-
-# 创建 /scripts/casper -> /scripts/live 符号链接
-if [ -d scripts ] && [ -f scripts/live ]; then
-    ln -sf live scripts/casper
-    log "Created /scripts/casper -> /scripts/live symlink"
-fi
-
-# 重新打包 initramfs
-find . | cpio -o -H newc 2>/dev/null | gzip -9 > "${ROOTFS}/boot/initrd.img-${KERNEL_VERSION}"
-cp "${ROOTFS}/boot/initrd.img-${KERNEL_VERSION}" "${ROOTFS}/boot/initrd.img"
 
 cd "$SCRIPT_DIR"
 
-log "initramfs rebuilt with casper support"
+log "initramfs rebuilt"
 
 # ========== 11. 构建 ISO ==========
 info "Step 11: Building ISO..."
